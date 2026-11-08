@@ -27,7 +27,7 @@ A step-by-step guide for WoW: Forever on Windows. It takes about five minutes.
 
 ## Step 2: Download Chupgrades
 
-1. Open **https://github.com/C0uldnotcomply/Chupgrades**. You need to be signed in, because the repository is private.
+1. Open **https://github.com/C0uldnotcomply/Chupgrades**. No GitHub account is needed.
 2. Click the green **Code** button, then **Download ZIP**.
 3. You'll get **`Chupgrades-main.zip`** in your Downloads folder.
 
