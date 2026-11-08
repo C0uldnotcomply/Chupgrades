@@ -21,7 +21,8 @@ the best-value upgrade for each slot, along with a shopping plan for the gold yo
   and class restrictions.
 * **Hit-cap aware.** Reads your current hit chance and values hit only up to the cap: same-level caps while
   levelling, raid caps at 60.
-* **Levelling mode.** Under 60, Stamina counts a little as a tie-breaker.
+* **Levelling mode.** Under 60, Stamina counts a little as a tie-breaker, and casters and healers get
+  minimum values for Intellect, MP5 and Spirit (level-60 sims barely value mana).
 * **Best-value ladder per slot.** Cheapest first, and each line is a bigger upgrade than the one above it. You can
   also show every upgrade.
 * **Shopping plan.** Picks the combination of items with the biggest total gain that fits your budget
@@ -66,7 +67,7 @@ the best-value upgrade for each slot, along with a shopping plan for the gold yo
 `Chupgrades/Config.lua` holds the tunable tables, each with comments:
 
 * `CU.WeightAdjust`: per-class and per-spec corrections to StatPriority's values
-* `CU.Levelling`: the level-60 cutoff and the Stamina tie-breaker value
+* `CU.Levelling`: the level-60 cutoff, the Stamina tie-breaker value, the casters' mana-stat minimums and per-spec minimums (`specFloors`)
 * `CU.HitCaps` / `CU.HitType`: hit caps by attack type and target, and which hit each spec uses
 * `CU.ExtraArmor`: extra armour types allowed per spec (e.g. cloth for caster druids)
 

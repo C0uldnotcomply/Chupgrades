@@ -45,6 +45,13 @@ function CU.IsLevelling()
   return (UnitLevel("player") or 1) < ((CU.Levelling and CU.Levelling.maxLevel) or 60)
 end
 
+-- Casters and healers: specs whose hit type in Config.lua is "spell" or "none".
+function CU.IsManaCaster(class, spec)
+  local ht = CU.HitType and class and CU.HitType[class]
+  local kind = ht and ((spec and ht[spec]) or ht.ALL)
+  return kind == "spell" or kind == "none"
+end
+
 -- Applies Config.lua's corrections and levelling Stamina on top of StatPriority's values.
 -- Works on a copy (StatPriority's own table is never changed) and reuses it while nothing
 -- relevant changes, so item scores can stay cached.
@@ -71,6 +78,17 @@ function CU.AdjustWeights(w)
   local stam = CU.Levelling and CU.Levelling.stamina
   if levelling and stam and CU.specRole ~= "tank" then
     t.ITEM_MOD_STAMINA_SHORT = math.max(t.ITEM_MOD_STAMINA_SHORT or 0, stam)
+  end
+  local floors = CU.Levelling and CU.Levelling.manaFloors
+  if levelling and floors and CU.IsManaCaster(class, spec) then
+    for k, v in pairs(floors) do t[k] = math.max(t[k] or 0, v) end
+  end
+  local sf = levelling and CU.Levelling and CU.Levelling.specFloors and class and CU.Levelling.specFloors[class]
+  sf = sf and ((spec and sf[spec]) or sf.ALL)
+  if type(sf) == "table" then
+    for k, v in pairs(sf) do
+      if type(v) == "number" then t[k] = math.max(t[k] or 0, v) end
+    end
   end
   adjusted, adjustedKey = t, key
   return t
@@ -775,7 +793,11 @@ function CU.ModeLine()
   if cfg.safeMode then return "|cffff8800Safe mode: plain StatPriority scoring (type /cu safe to switch back).|r" end
   local parts = {}
   if CU.specName then table.insert(parts, CU.specName .. (CU.specChosen and " (chosen)" or " (detected)")) end
-  table.insert(parts, CU.IsLevelling() and "levelling mode (Stamina counts a little)" or "level-60 mode")
+  local lvlNote = "levelling mode (Stamina counts a little)"
+  if CU.IsManaCaster(select(2, UnitClass("player")), CU.specID) then
+    lvlNote = "levelling mode (Stamina and mana stats count more)"
+  end
+  table.insert(parts, CU.IsLevelling() and lvlNote or "level-60 mode")
   local hit = CU.HitInfo()
   if hit then
     table.insert(parts, ("hit %.1f%% of %g%% cap%s"):format(hit.current, hit.cap,

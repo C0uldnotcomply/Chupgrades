@@ -51,7 +51,22 @@ CU.WeightAdjust = {
     -- Discipline (256) and Holy (257): StatPriority's healer values look sound, unchanged.
   },
   DRUID = {
-    [102] = { ITEM_MOD_SPELL_HEALING_DONE_SHORT = 0.33 },   -- Balance: same healing-counts-as-damage rule
+    -- Balance: same healing-counts-as-damage rule, plus two fixes to the Classic sim values
+    -- StatPriority uses:
+    --   * Haste: StatPriority has 0.08 per rating (Classic Balance had almost no haste, so the
+    --     sim barely valued it). Forever's Nature's Grace grants haste; 0.5 sits between
+    --     GearQuest (0.6) and the other casters' sim values (Mage 0.69, Warlock 0.78).
+    --   * MP5: StatPriority has 0. Mana is Balance's known weak point (theforeverera.com,
+    --     Elitist Gaming list MP5 after Intellect); GearQuest uses 0.3.
+    --   * Intellect: StatPriority has 0.16, which is mostly its crit value (about 60 Int per 1%
+    --     crit in Classic, 1% crit = 7.5 Spell Power). The short sim fight hardly counts the
+    --     mana, which is Balance's limiting factor over a real fight. 0.30 sits between that
+    --     and GearQuest's 0.40. (Forever has no GetSpellCritChanceFromIntellect, so this can't
+    --     be worked out from the character.)
+    [102] = { ITEM_MOD_SPELL_HEALING_DONE_SHORT = 0.33,
+              ITEM_MOD_HASTE_RATING_SHORT = 0.5, ITEM_MOD_HASTE_SPELL_RATING_SHORT = 0.5,
+              ITEM_MOD_MANA_REGENERATION_SHORT = 0.3, ITEM_MOD_POWER_REGEN0_SHORT = 0.3,
+              ITEM_MOD_INTELLECT_SHORT = 0.30 },
     -- Feral (103), Guardian (104) and Restoration (105): StatPriority's values look sound, unchanged.
   },
 }
@@ -66,8 +81,39 @@ CU.ExtraArmor = {
 --   * Stamina counts as a tie-breaker: 0.25 = 4 Stamina worth 1 Attack Power / Spell Power.
 --     Damage sims value Stamina at 0 because they never die; while levelling, deaths cost time.
 --     Tanks keep StatPriority's own (much higher) Stamina value.
+--   * Mana casters and healers (specs whose CU.HitType is "spell" or "none") also get the
+--     minimum values in manaFloors. StatPriority's values come from level-60 raid sims, where
+--     fights are short and mana barely matters, so they put Intellect, MP5 and Spirit near 0
+--     (Balance: Intellect 0.16, MP5 and Spirit 0). While levelling, mana is what limits how
+--     long you can keep casting. A stat that's already worth more keeps its own value.
+--     Intellect 0.35 keeps it ahead of the Stamina tie-breaker.
 --   * Hit caps are the ones against same-level enemies instead of raid bosses.
-CU.Levelling = { maxLevel = 60, stamina = 0.25 }
+CU.Levelling = {
+  maxLevel = 60,
+  stamina = 0.25,
+  manaFloors = {
+    ITEM_MOD_INTELLECT_SHORT = 0.35,
+    ITEM_MOD_MANA_REGENERATION_SHORT = 0.5, ITEM_MOD_POWER_REGEN0_SHORT = 0.5,  -- MP5 (two keys)
+    ITEM_MOD_SPIRIT_SHORT = 0.1,
+  },
+  -- Per-spec minimums while levelling, by class then spec (ALL = every spec of the class).
+  -- Applied after manaFloors; again, a stat that's already worth more keeps its own value.
+  specFloors = {
+    DRUID = {
+      [102] = {  -- Balance
+        -- Intellect 0.45: mana decides how many mobs you kill before drinking, and Balance
+        -- runs dry fastest. (GearQuest: 0.80, but it scales Stamina x3 too.)
+        ITEM_MOD_INTELLECT_SHORT = 0.45,
+        -- Armour 0.02 = 50 armour worth 1 Spell Power. StatPriority gives armour 0, so a cloth
+        -- piece with a point more Intellect beat a leather piece with double the armour.
+        -- Balance fights in Moonkin Form, which in Classic multiplies armour from items by
+        -- 4.6 (+360%). Leather now wins close calls; cloth still wins with clearly better
+        -- stats. GearQuest uses 0.008 while levelling (no Moonkin factor).
+        RESISTANCE0_NAME = 0.02,
+      },
+    },
+  },
+}
 
 -- Hit stops counting once you reach these (% hit), by attack type and target.
 -- Source: method.gg's WoW Forever hit guide (caps assume maxed weapon skill).
