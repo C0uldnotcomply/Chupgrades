@@ -56,6 +56,7 @@ the best-value upgrade for each slot, along with a shopping plan for the gold yo
 | `/cu levelling auto\|on\|off` | Levelling mode |
 | `/cu hit` | Your hit and hit cap. `/cu hit off\|on` toggles cap tracking |
 | `/cu weights` | Show the stat values in use |
+| `/cu why <link>` | Why an item is or isn't listed: scan, slot, usability, score, filters, budget |
 | `/cu item <link>` | Debug how one item is scored |
 | `/cu safe` | Safe mode: plain StatPriority scoring (rollback switch) |
 | `/cu tab` | Diagnostics for the Auction House tab |

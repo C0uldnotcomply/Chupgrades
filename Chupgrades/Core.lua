@@ -1667,12 +1667,83 @@ ev:SetScript("OnEvent", function(_, event, arg1)
   end
 end)
 
+-- /cu why <item link>: walks through every check for one item and says where it drops out.
+function CU.Why(text)
+  local link = text and text:match("|H.-|h.-|h")
+  if not link then Print("Usage: type /cu why and shift-click an item into the chat line.") return end
+  local weights = WeightsOrSay()
+  if not weights then return end
+  local id = tonumber(link:match("item:(%d+)"))
+  local name = GetItemInfo(link) or link
+  local function Say(ok, msg) print("   " .. (ok and "|cff00ff00OK|r  " or "|cffff4444NO|r  ") .. msg) end
+  Print("Why is " .. link .. " (not) listed?")
+
+  -- 1. In the scan? (any version of it: "of the X" rolls are different listings)
+  local versions = {}
+  for l, a in pairs(CU.lastScan or {}) do
+    if tonumber(l:match("item:(%d+)")) == id then table.insert(versions, { link = l, a = a }) end
+  end
+  if not CU.lastScan then Say(false, "No scan yet.") return end
+  local age = math.floor((time() - (CU.lastScanTime or time())) / 60)
+  if #versions == 0 then
+    Say(false, ("Not in your last scan (%d min ago). It may have been listed since: rescan when the countdown allows."):format(age))
+    return
+  end
+  table.sort(versions, function(x, y) return x.a.price < y.a.price end)
+  Say(true, ("In your last scan (%d min ago): %d version%s, cheapest %s."):format(age, #versions,
+    #versions == 1 and "" or "s", Money(versions[1].a.price)))
+
+  local level = UnitLevel("player")
+  for i, v in ipairs(versions) do
+    if i > 3 then print("   ...and " .. (#versions - 3) .. " more versions.") break end
+    local l, a = v.link, v.a
+    local sum = StatSummary(l)
+    print(("  |cffffd100Version %d:|r %s %s, %s"):format(i, l, sum ~= "" and ("(" .. sum .. ")") or "", Money(a.price)))
+    local def = EQUIP[a.equipLoc]
+    local group = def and def[1] or "?"
+    -- 2. Slot shown?
+    Say(not cfg.hiddenSlots[group], ("Slot: %s%s"):format(group, cfg.hiddenSlots[group] and " is unticked in the slot tickboxes" or " is ticked"))
+    -- 3. Usable?
+    local ok, why = CanUse(l, a.equipLoc, a.classID, a.subID)
+    if ok == nil then Say(false, "The game hasn't sent this item's details yet. Try again in a moment.")
+    elseif not ok then Say(false, "Can't use it: " .. tostring(why))
+    else
+      Say(true, "You can use it" .. ((type(why) == "number" and why > level) and (" from level " .. why) or ""))
+      -- 4. Score vs what you wear
+      local new = ScoreItem(l, weights) or 0
+      local old, oldHit = EquippedScore(def, weights)
+      local gain = HitAwareGain(new, HitRating(l), old, oldHit, weights, CU.HitInfo())
+      local pct = old > 0 and gain / old * 100 or (new > 0 and math.huge or 0)
+      local gearBase = GearScore(weights)
+      local capNote = math.abs(gain - (new - old)) > 0.005 and " after the hit-cap adjustment (hit past your cap doesn't count)" or ""
+      Say(gain > 0, ("Scores %.2f vs %.2f for what you wear: %s points%s (%+.1f%% overall)."):format(new, old,
+        (gain >= 0 and "+" or "") .. ("%.2f"):format(gain), capNote, gearBase > 0 and gain / gearBase * 100 or 0))
+      if gain > 0 and old > 0 then
+        Say(pct >= cfg.minUpgradePct, ("Slot upgrade %.1f%%, minimum is %g%% (/cu min to change)."):format(pct, cfg.minUpgradePct))
+      end
+      -- 5. Filters
+      local probe = { quality = select(3, GetItemInfo(l)), setID = select(16, GetItemInfo(l)) }
+      local passes = PassesFilters(probe)
+      Say(passes, passes and "Passes the quality / set-piece filters."
+        or ("Hidden by the quality / set-piece filters (quality: %s)."):format(QUALITY_NAMES[probe.quality or -1] or "?"))
+      -- 6. Plan: affordable, usable now?
+      local budget = CU.Budget()
+      Say(a.price <= budget, ("Price %s vs plan budget %s."):format(Money(a.price), Money(budget)))
+      if type(why) == "number" and why > level then Say(false, "The Plan only buys gear you can wear right now.") end
+    end
+  end
+  print("   |cff999999If everything says OK but it's missing from the best-value list, a cheaper item that's a bigger"
+    .. " upgrade beats it: tick \"Show every upgrade\" to see all of them.|r")
+end
+
 SLASH_CHUPGRADES1 = "/cu"
 SLASH_CHUPGRADES2 = "/chupgrades"
 SlashCmdList.CHUPGRADES = function(msg)
   local cmd, rest = (msg or ""):match("^(%S*)%s*(.-)$")
   cmd = cmd:lower()
-  if cmd == "tab" then
+  if cmd == "why" then
+    CU.Why(rest)
+  elseif cmd == "tab" then
     Print("Diagnostics:")
     print("   AuctionHouseFrame exists: " .. tostring(AuctionHouseFrame ~= nil) .. ", shown: " .. tostring(AuctionHouseFrame and AuctionHouseFrame:IsShown() or false))
     print("   LibStub: " .. tostring(LibStub ~= nil) .. ", LibAHTab: " .. tostring(LibStub and LibStub("LibAHTab-1-0", true) ~= nil))
@@ -1798,6 +1869,7 @@ SlashCmdList.CHUPGRADES = function(msg)
     print("   /cu hit  - your hit and cap;  /cu hit off|on  - stop/start valuing hit only up to the cap")
     print("   /cu levelling auto|on|off  - levelling mode (now " .. tostring(cfg.levelling) .. ")")
     print("   /cu safe  - toggle safe mode: plain StatPriority scoring (rollback switch)")
+    print("   /cu why <link>  - why an item is or isn't listed (shift-click the item into the command)")
     print("   /cu item <link>  - debug how one item is scored")
   end
 end

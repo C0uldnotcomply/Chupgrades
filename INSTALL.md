@@ -149,6 +149,7 @@ You can also pick the spec inside Chupgrades itself (Step 7). That choice is ind
 | "No stat addon found" | StatPriority isn't installed or isn't ticked in the AddOns list. |
 | "StatPriority doesn't know your spec yet" | Spend a talent point, or tick a spec in Chupgrades. |
 | Scan button greyed out | Blizzard's 15-minute full-scan limit. Wait for the countdown, or type `/cu scan` to try anyway. |
+| An item you can see on the AH isn't listed | Type `/cu why ` and shift-click the item: it checks scan, slot tickboxes, usability, score, filters and budget, and says where it drops out. |
 | Results look wrong | Click the item to see its breakdown. Type `/cu safe` to compare with plain StatPriority scoring. |
 | Nothing happens and no error shows | Type `/console scriptErrors 1`, then `/reload`, to show Lua errors. |
 
