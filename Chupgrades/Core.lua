@@ -668,10 +668,12 @@ function CU:BuildResults()
           -- Which slot(s) to compare against. With dual wield on, a one-hander is checked
           -- against your main hand AND your off hand, and can show up under both.
           local oldScore, oldHit = EquippedScore(def, weights)
-          local targets = { { def[1], oldScore, oldHit } }
+          local hasItem = false
+          for _, slot in ipairs(def[2]) do if GetInventoryItemLink("player", slot) then hasItem = true end end
+          local targets = { { def[1], oldScore, oldHit, hasItem } }
           local newHit = HitRating(link)
           if cfg.dualWield and a.equipLoc == "INVTYPE_WEAPON" and mhLoc ~= "INVTYPE_2HWEAPON" then
-            table.insert(targets, { "Off Hand", ohScore, ohHit })
+            table.insert(targets, { "Off Hand", ohScore, ohHit, ohLink ~= nil })
           end
           for _, t in ipairs(targets) do
             local group, old = t[1], t[2]
@@ -682,6 +684,7 @@ function CU:BuildResults()
               groups[group] = groups[group] or {}
               table.insert(groups[group], {
                 link = link, price = a.price, upgradePct = pct, empty = empty, group = group, oldScore = old,
+                slotHasItem = t[4],
                 rank = empty and (1e6 + new) or pct, reqLevel = reqLevel,
                 score = new, gain = empty and new or gain, equipLoc = a.equipLoc, hitWasted = wasted,
                 quality = select(3, GetItemInfo(link)), setID = select(16, GetItemInfo(link)),
@@ -1477,7 +1480,8 @@ function CU:Render()
         -- (A percentage of the slot alone balloons when your current item there is weak.)
         local overall = gearBase > 0 and (it.gain / gearBase * 100) or 0
         local gain = ("|cff00ff00+%.1f%% overall|r  |cff999999(%.2f%% per gold)%s|r"):format(
-          overall, overall / math.max(it.price / 10000, 1), it.empty and ", empty slot" or "")
+          overall, overall / math.max(it.price / 10000, 1),
+          it.empty and (it.slotHasItem and ", replaces an item with no useful stats" or ", empty slot") or "")
         local lvl    = (it.reqLevel and it.reqLevel > level) and ("  |cffff8800usable at %d|r"):format(it.reqLevel) or ""
         local afford = (it.price > money) and "  |cffff4444can't afford|r" or ""
         local hitNote = it.hitWasted and "  |cff999999(hit past your cap not counted)|r" or ""

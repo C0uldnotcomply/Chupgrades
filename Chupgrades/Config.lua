@@ -26,6 +26,7 @@ CU.Defaults = {
 -- Values are per point of the stat, on StatPriority's scale: 1 = one point of Attack Power
 -- (physical specs) or one point of Spell Power (casters and healers).
 -- Spec IDs: Hunter 253 Beast Mastery, 254 Marksmanship, 255 Survival;
+--           Priest 256 Discipline, 257 Holy, 258 Shadow;
 --           Mage 62 Arcane, 63 Fire, 64 Frost;  Druid 102 Balance, 103 Feral, 104 Guardian, 105 Restoration.
 -- Type /cu safe in game to switch ALL of these off and score with plain StatPriority values.
 CU.WeightAdjust = {
@@ -40,6 +41,10 @@ CU.WeightAdjust = {
     -- In Forever one third of bonus healing also counts as bonus damage, so "+healing" items
     -- aren't worthless to a damage caster. StatPriority values them at 0.
     ALL = { ITEM_MOD_SPELL_HEALING_DONE_SHORT = 0.33 },
+  },
+  PRIEST = {
+    [258] = { ITEM_MOD_SPELL_HEALING_DONE_SHORT = 0.33 },   -- Shadow: same healing-counts-as-damage rule
+    -- Discipline (256) and Holy (257): StatPriority's healer values look sound, unchanged.
   },
   DRUID = {
     [102] = { ITEM_MOD_SPELL_HEALING_DONE_SHORT = 0.33 },   -- Balance: same healing-counts-as-damage rule
