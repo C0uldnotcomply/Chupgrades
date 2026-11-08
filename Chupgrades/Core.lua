@@ -675,12 +675,17 @@ function CU:BuildResults()
     local upgrades = 0
     for _, items in pairs(groups) do upgrades = upgrades + #items end
     Print(("%d pieces of gear for sale, %d you can use, %d are upgrades for you%s."):format(
-      total, usable, upgrades, loading > 0 and (" (" .. loading .. " still had no details)") or ""))
+      total, usable, upgrades, loading > 0 and (" (" .. loading .. " still waiting for details: they'll be added as they arrive)") or ""))
     self.summaryShown = true
   end
 
   self.lastAll = groups
+  -- Items still waiting for details are re-checked when the game delivers them (see the
+  -- GET_ITEM_INFO_RECEIVED handler) and whenever the results are shown again.
+  self.pendingLoading = loading
+  self.inBuild = true
   self:Render()
+  self.inBuild = false
 end
 
 -- Quality and set-piece filters. Returns the items that pass, and how many were hidden.
@@ -1367,6 +1372,11 @@ function CU:RenderPlan(m)
 end
 
 function CU:Render()
+  -- Some items had no details last time: score everything again (cheap; scores are cached).
+  if (self.pendingLoading or 0) > 0 and not self.inBuild and self.lastScan then
+    self.retries = 99 -- no extra retry loop, just one fresh pass
+    return self:BuildResults()
+  end
   self:BuildViews()
   local groups = self.lastLadders or {}
   local w = GetWindow()
@@ -1611,6 +1621,7 @@ Listen("PLAYER_EQUIPMENT_CHANGED")              -- you bought and equipped somet
 Listen("PLAYER_LEVEL_UP")
 Listen("SKILL_LINES_CHANGED")                   -- trained a new weapon skill
 Listen("PLAYER_MONEY")                          -- gold changed: the plan's budget changed
+Listen("GET_ITEM_INFO_RECEIVED")                -- item details arrived: re-check items that were waiting
 ev:SetScript("OnEvent", function(_, event, arg1)
   if event == "ADDON_LOADED" and arg1 == "Chupgrades" then
     ChupgradesDB = ChupgradesDB or {}
@@ -1657,6 +1668,11 @@ ev:SetScript("OnEvent", function(_, event, arg1)
     MakeAHTab()
     C_Timer.After(0.2, function() if not CU.ahTabMade then MakeAHTab() end end)
     C_Timer.After(1, function() if not CU.ahTabMade then MakeAHTab(true) end end)
+  elseif event == "GET_ITEM_INFO_RECEIVED" then
+    if (CU.pendingLoading or 0) > 0 and CU.lastScan and win and win:IsShown() then
+      if CU.itemInfoTimer then CU.itemInfoTimer:Cancel() end
+      CU.itemInfoTimer = C_Timer.NewTimer(1, function() CU.retries = 99; CU:BuildResults() end)
+    end
   elseif event == "PLAYER_MONEY" then
     if cfg.view == "plan" and CU.lastLadders and win and win:IsShown() then CU:Render() end
   elseif event == "PLAYER_EQUIPMENT_CHANGED" then
