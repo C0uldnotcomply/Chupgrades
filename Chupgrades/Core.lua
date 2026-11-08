@@ -569,39 +569,66 @@ scanFrame:SetScript("OnEvent", function(self)
   end)
 end)
 
+-- Reading the scan. Blizzard's full scan often hands over listings before their item link is
+-- ready. Each pass reads everything it can, asks the game to load what's missing, and tries
+-- again (up to SCAN_PASSES x 2 seconds). On the last pass anything still unreadable falls back
+-- to the item's plain link (right for most items; "of the X" rolls can't be told apart then).
+local SCAN_PASSES = 15
+
 function CU:ProcessScan()
-  local cheapest, n, notReady = {}, C_AuctionHouse.GetNumReplicateItems(), 0
+  local cheapest, n, notReady, fallback, bidOnly = {}, C_AuctionHouse.GetNumReplicateItems(), 0, 0, 0
+  local final = (self.scanPasses or 0) >= SCAN_PASSES - 1
+  local missingIDs = {}
   for i = 0, n - 1 do
     local _, _, count, _, _, _, _, _, _, buyout, _, _, _, _, _, _, itemID = C_AuctionHouse.GetReplicateItemInfo(i)
-    if itemID and buyout and buyout > 0 then
+    if itemID then
       local _, _, _, equipLoc, _, classID, subID = GetItemInfoInstant(itemID)
       if EQUIP[equipLoc] and (classID == 2 or classID == 4) then
-        local link = C_AuctionHouse.GetReplicateItemLink(i)
-        if not link then notReady = notReady + 1 end
-        if link then
-          local price = buyout / math.max(count or 1, 1)
-          if not cheapest[link] or price < cheapest[link].price then
-            cheapest[link] = { price = price, equipLoc = equipLoc, classID = classID, subID = subID }
+        if not (buyout and buyout > 0) then
+          bidOnly = bidOnly + 1
+        else
+          local link = C_AuctionHouse.GetReplicateItemLink(i)
+          if not link and final then
+            link = select(2, GetItemInfo(itemID))
+            if link then fallback = fallback + 1 end
+          end
+          if not link then
+            notReady = notReady + 1
+            missingIDs[itemID] = true
+          else
+            local price = buyout / math.max(count or 1, 1)
+            if not cheapest[link] or price < cheapest[link].price then
+              cheapest[link] = { price = price, equipLoc = equipLoc, classID = classID, subID = subID }
+            end
           end
         end
       end
     end
   end
-  -- Some listings arrive without their full details at first. The scan data stays available,
-  -- so give the game a few more seconds and read it again rather than dropping them.
   self.scanPasses = (self.scanPasses or 0) + 1
-  if notReady > 0 and self.scanPasses < 6 then
-    Print(("Waiting for details on %d listings..."):format(notReady))
+  if notReady > 0 and self.scanPasses < SCAN_PASSES then
+    for id in pairs(missingIDs) do
+      if C_Item and C_Item.RequestLoadItemDataByID then pcall(C_Item.RequestLoadItemDataByID, id) end
+    end
+    if self.scanPasses == 1 or self.scanPasses % 5 == 0 then
+      Print(("Reading the scan: waiting for details on %d listings..."):format(notReady))
+    end
     C_Timer.After(2, function() CU:ProcessScan() end)
     return
   end
   self.scanPasses = 0
   self.lastScan, self.lastScanTime, self.retries, self.summaryShown = cheapest, time(), 0, false
+  self.lastScanStats = { listings = n, unread = notReady, fallback = fallback, bidOnly = bidOnly }
   -- Keep it between /reloads and logins: a full scan is only allowed about every 15 minutes.
   cfg.savedScan = { time = self.lastScanTime, items = cheapest }
   local found = 0
   for _ in pairs(cheapest) do found = found + 1 end
-  Print(("Scan done: %d listings checked, %d different pieces of gear for sale."):format(n, found))
+  local extra = {}
+  if fallback > 0 then table.insert(extra, fallback .. " read from the item's plain version") end
+  if notReady > 0 then table.insert(extra, "|cffff8800" .. notReady .. " couldn't be read|r") end
+  if bidOnly > 0 then table.insert(extra, bidOnly .. " bid-only (no buyout) skipped") end
+  Print(("Scan done: %d listings, %d different pieces of gear for sale%s."):format(n, found,
+    #extra > 0 and (" (" .. table.concat(extra, ", ") .. ")") or ""))
   if self.updateTabStatus then self.updateTabStatus() end
   self:BuildResults()
 end
@@ -1702,7 +1729,29 @@ function CU.Why(text)
   if not CU.lastScan then Say(false, "No scan yet.") return end
   local age = math.floor((time() - (CU.lastScanTime or time())) / 60)
   if #versions == 0 then
-    Say(false, ("Not in your last scan (%d min ago). It may have been listed since: rescan when the countdown allows."):format(age))
+    -- Is it in Blizzard's raw scan data (still in memory until /reload)?
+    local raw, rawBuyout, rawLink
+    local n = (C_AuctionHouse and C_AuctionHouse.GetNumReplicateItems and C_AuctionHouse.GetNumReplicateItems()) or 0
+    for i = 0, n - 1 do
+      local info = { C_AuctionHouse.GetReplicateItemInfo(i) }
+      if info[17] == id then raw, rawBuyout, rawLink = i, info[10], C_AuctionHouse.GetReplicateItemLink(i) break end
+    end
+    if raw then
+      if not (rawBuyout and rawBuyout > 0) then
+        Say(false, "It's in Blizzard's scan data but has no buyout price (bid only). Chupgrades only counts buyouts.")
+      else
+        Say(false, ("It's in Blizzard's scan data (buyout %s) but Chupgrades couldn't read it%s. This is a scan-reading bug: please report it."):format(
+          Money(rawBuyout), rawLink and "" or " (no item link yet)"))
+      end
+    elseif n > 0 then
+      Say(false, ("Not in your last scan (%d min ago), and not in Blizzard's scan data either: it was listed after the scan. Rescan when the countdown allows."):format(age))
+    else
+      Say(false, ("Not in your last scan (%d min ago). It may have been listed since: rescan when the countdown allows."):format(age))
+    end
+    local st = CU.lastScanStats
+    if st and (st.unread > 0 or st.fallback > 0) then
+      print(("   |cff999999That scan: %d listings, %d couldn't be read, %d read from plain versions.|r"):format(st.listings, st.unread, st.fallback))
+    end
     return
   end
   table.sort(versions, function(x, y) return x.a.price < y.a.price end)
