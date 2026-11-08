@@ -27,12 +27,9 @@ A step-by-step guide for WoW: Forever on Windows. It takes about five minutes.
 
 ## Step 2: Download Chupgrades
 
-1. Open the Chupgrades repository on GitHub. You need to be signed in, because the repository is private.
-2. On the right, click **Releases**, then the newest release.
-3. Under **Assets**, download **`Chupgrades-vX.Y.Z.zip`**.
-
-> **Downloaded "Code → Download ZIP" instead?** That works too, but the zip contains an
-> extra folder layer. See the note in Step 4.
+1. Open **https://github.com/C0uldnotcomply/Chupgrades**. You need to be signed in, because the repository is private.
+2. Click the green **Code** button, then **Download ZIP**.
+3. You'll get **`Chupgrades-main.zip`** in your Downloads folder.
 
 ---
 
@@ -55,9 +52,14 @@ You should see folders such as `Auctionator` and `StatPriority` in there.
 
 ## Step 4: Put Chupgrades in the AddOns folder
 
-1. Right-click the downloaded zip and choose **Extract All...**
-2. Click **Browse** and choose the **AddOns** folder from Step 3, then click **Extract**.
-3. **Check the result.** This file must exist:
+The download has one extra folder layer: `Chupgrades-main` contains the guides **and** the actual addon
+folder, `Chupgrades`. Only that inner `Chupgrades` folder goes into AddOns.
+
+1. Right-click **`Chupgrades-main.zip`** and choose **Extract All...**, then click **Extract**. Your Downloads folder is fine.
+2. Open the extracted **`Chupgrades-main`** folder. Inside you'll see `Chupgrades`, `README.md` and `INSTALL.md`.
+3. **Copy the `Chupgrades` folder** (right-click → Copy).
+4. Open your **AddOns** folder from Step 3 and **paste** it there.
+5. **Check the result.** This file must exist:
 
    ```
    ...\Interface\AddOns\Chupgrades\Chupgrades.toc
@@ -65,11 +67,11 @@ You should see folders such as `Auctionator` and `StatPriority` in there.
 
    | ✅ Right | ❌ Wrong |
    | --- | --- |
-   | `AddOns\Chupgrades\Chupgrades.toc` | `AddOns\Chupgrades\Chupgrades\Chupgrades.toc` |
-   | | `AddOns\Chupgrades-main\Chupgrades\Chupgrades.toc` |
+   | `AddOns\Chupgrades\Chupgrades.toc` | `AddOns\Chupgrades-main\Chupgrades\Chupgrades.toc` |
+   | | `AddOns\Chupgrades\Chupgrades\Chupgrades.toc` |
 
-   If it's wrong, move the **inner** `Chupgrades` folder (the one containing `Chupgrades.toc`)
-   straight into `AddOns`, then delete the leftover outer folder.
+   If you see one of the wrong layouts, move the folder that **contains** `Chupgrades.toc` straight into `AddOns`,
+   and delete any leftover outer folder. WoW only finds the addon when the `.toc` file is exactly one folder deep.
 
 > **Updating from an older version?** Delete the old `AddOns\Chupgrades` folder first, then
 > extract the new one. Your settings and last scan are kept: they live in WoW's `WTF` folder,
@@ -156,8 +158,8 @@ You can also pick the spec inside Chupgrades itself (Step 7). That choice is ind
 
 * **Quick switch:** `/cu safe` turns off all of Chupgrades' own scoring corrections and uses plain StatPriority values.
   Type it again to switch back.
-* **Older version:** download an older zip from **Releases** and repeat Step 4. You'll need to delete the
-  current folder first.
+* **Older version:** on GitHub, click **commits**, open an older commit, then **Browse files** → **Code** →
+  **Download ZIP**, and repeat Step 4. You'll need to delete the current folder first.
 
 ## Uninstalling
 
