@@ -8,7 +8,7 @@ A step-by-step guide for WoW: Forever on Windows. It takes about five minutes.
 
 | Addon | Needed? | Why |
 | --- | --- | --- |
-| **StatPriority** (by Todd King, on CurseForge) | **Yes** | Supplies your spec and its stat values. Chupgrades can't score gear without it. |
+| **StatPriority** (by Todd King, on CurseForge), or **StatLedger** | **One is required** | Supplies stat values for scoring gear. StatPriority is recommended and is used when both are loaded. |
 | **Auctionator** (on CurseForge) | Strongly recommended | Provides the Chupgrades tab on the Auction House and does the buying when you send items to it. |
 | **Chupgrades** | Yes | This addon. |
 
@@ -27,7 +27,7 @@ A step-by-step guide for WoW: Forever on Windows. It takes about five minutes.
 
 ## Step 2: Download Chupgrades
 
-1. Open **https://github.com/C0uldnotcomply/Chupgrades**. No GitHub account is needed.
+1. Open [the Chupgrades repository](https://github.com/C0uldnotcomply/Chupgrades). No GitHub account is needed.
 2. Click the green **Code** button, then **Download ZIP**.
 3. You'll get **`Chupgrades-main.zip`** in your Downloads folder.
 
@@ -112,12 +112,18 @@ You can also pick the spec inside Chupgrades itself (Step 7). That choice is ind
 1. Go to an **Auctioneer** and open the Auction House.
 2. Click the **Chupgrades** tab along the bottom, next to Auctionator's tabs.
 3. Under **Score upgrades for:**, tick your spec, or leave **Auto**.
-4. Click **Scan for upgrades**. It takes up to a minute.
-5. Click **Show upgrades by slot** or **Plan my purchases**.
+4. Click the full-scan button, or **Search slots** for a smaller search of the selected slots.
+5. Open the results and choose **Biggest upgrades**, **Best value** or the shopping plan.
 
 > Blizzard only allows a **full scan about every 15 minutes**, and that allowance is shared with Auctionator's
 > full scan. The tab shows a countdown. Your last scan is saved, so you can change spec, filters or
 > budget at any time without scanning again.
+
+Targeted slot searches use the normal Auction House search queue instead of that full-scan allowance.
+They still need the Auction House open and can be throttled. `/cu search head ring`, for example, searches
+only those slots. `/cu searchcap 400` raises the rolled-item lookup limit; `/cu floor off` includes lower-level
+gear that the normal search floor would skip. A larger search can take longer.
+Use `/cu stop` to cancel a search and keep your previous results.
 
 ---
 
@@ -125,15 +131,33 @@ You can also pick the spec inside Chupgrades itself (Step 7). That choice is ind
 
 | Click | What happens |
 | --- | --- |
-| Click an item | Breakdown on the right: each stat, what it's worth to you, and the weighted % increase |
+| Click an item | Open its stat and score breakdown |
 | **Alt**-click an item | Search for it in Auctionator |
 | **Shift**-click an item | Link it in chat |
 | **Ctrl**-click an item | Preview it on your character |
 
-* **Slot tickboxes:** choose which slots to include. Shift-click a slot to show only that slot.
+* **Slot tickboxes:** choose which slots to search and include in the plan. Click a slot's row to view it.
 * **Quality / Set pieces:** filter by item quality, or show only (or no) set pieces.
-* **Plan my purchases:** the best combination of upgrades for your budget. Enter gold, silver and copper
-  in the **Budget** boxes, or leave them empty to use what you carry.
+* **Biggest upgrades:** the five largest upgrades for the selected slot.
+* **Best value:** a cheapest-first ladder where each step is a bigger upgrade. **Show every upgrade**
+  includes items outside that ladder. Use the page controls to move through more than six results.
+* **Shopping plan:** suggests purchases for your budget. In **Budget** and **Keep**, enter amounts
+  such as `1g 33s 38c` or `5` for five gold. **Enter** applies the field; **Escape** restores its saved value.
+  A blank budget uses the money you carry; a blank keep-back amount clears the reserve.
+* **Move the window:** drag it to a convenient position. That position is saved. `/cu reset` restores its
+  position if you want to start again.
+
+Money and numeric commands reject invalid input without changing your existing setting. `/cu budget`
+uses carried money, `/cu keep` clears the reserve, and `/cu ahead 3` includes items usable within three
+levels. Look-ahead gear is shown in lists, but the shopping plan only includes items usable now.
+
+The plan is an estimate, not a guaranteed optimum: prices round up for budgeting, and combinations are
+selected before correcting their total for shared hit-cap headroom. It also does not plan a switch from
+your equipped two-hander to a new main-hand/off-hand pair.
+
+If a search reaches its lookup limit, times out or cannot read some listings, its coverage is partial.
+Older results may be retained and can be stale. Unread random-stat listings are skipped rather than
+given guessed stats. Search fewer slots, increase `/cu searchcap`, or retry to improve coverage.
 
 > ⚠️ Items marked **"may vary in stats"** (names like *"...of Power"*) come in versions with different stats.
 > Auctionator's search row only shows the plain version. Buy the listing whose stats match the
@@ -146,9 +170,11 @@ You can also pick the spec inside Chupgrades itself (Step 7). That choice is ind
 | Problem | Fix |
 | --- | --- |
 | No Chupgrades tab on the Auction House | Fully exit and restart WoW (not `/reload`) after a first install. Check Step 4's folder layout and Step 5's AddOns list. |
-| "No stat addon found" | StatPriority isn't installed or isn't ticked in the AddOns list. |
+| "No stat addon found" | Enable StatPriority or StatLedger in the AddOns list. |
 | "StatPriority doesn't know your spec yet" | Spend a talent point, or tick a spec in Chupgrades. |
-| Scan button greyed out | Blizzard's 15-minute full-scan limit. Wait for the countdown, or type `/cu scan` to try anyway. |
+| Full scan is on cooldown | Wait for the countdown, or use **Search slots**. `/cu scan` can try a full scan anyway, but Blizzard may refuse it. |
+| Search stopped or results are marked partial | Keep the Auction House open. Retry fewer slots or increase `/cu searchcap` if the lookup limit was reached. |
+| Window is in the wrong place | Type `/cu reset` to restore its position and screen fit. |
 | An item you can see on the AH isn't listed | Type `/cu why ` and shift-click the item: it checks scan, slot tickboxes, usability, score, filters and budget, and says where it drops out. |
 | Results look wrong | Click the item to see its breakdown. Type `/cu safe` to compare with plain StatPriority scoring. |
 | Nothing happens and no error shows | Type `/console scriptErrors 1`, then `/reload`, to show Lua errors. |

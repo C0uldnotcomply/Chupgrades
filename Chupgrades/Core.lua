@@ -16,6 +16,46 @@ local GetItemStats       = (C_Item and C_Item.GetItemStats) or GetItemStats
 
 local function Print(...) print("|cff33ff99Chupgrades:|r", ...) end
 
+local MAX_MONEY = 2147483647
+local function Finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
+local function ValidNumber(n, lo, hi, integer)
+  return Finite(n) and n >= lo and n <= hi and (not integer or n == math.floor(n))
+end
+local function RequestItem(item)
+  local id = type(item) == "number" and item or type(item) == "string" and tonumber(item:match("item:(%d+)"))
+  if id and C_Item and C_Item.RequestLoadItemDataByID then pcall(C_Item.RequestLoadItemDataByID, id) end
+end
+
+-- Bare numbers are gold. Unit amounts may be joined (1g33s) or separated by spaces.
+function CU.ParseMoney(text)
+  text = type(text) == "string" and text:lower():match("^%s*(.-)%s*$") or ""
+  if text == "" then return nil, "Enter an amount, such as 5 or 1g 33s 38c." end
+  local total, number = 0, tonumber(text)
+  if text:match("^%d*%.?%d+$") and number then
+    total = number * 10000
+  else
+    local pos, seen = 1, {}
+    while pos <= #text do
+      local first, last, amount, unit = text:find("%s*(%d*%.?%d+)%s*([gsc])%s*", pos)
+      if first ~= pos or seen[unit] then return nil, "Use gold, silver and copper, for example 1g 33s 38c." end
+      seen[unit] = true
+      total = total + tonumber(amount) * ({g=10000,s=100,c=1})[unit]
+      pos = last + 1
+    end
+  end
+  if not ValidNumber(total, 0, MAX_MONEY) then return nil, "That money amount is out of range." end
+  return math.floor(total + .5)
+end
+
+local function CancelTimer(timer) if timer then timer:Cancel() end end
+local function SameKey(a, b)
+  if type(a) ~= "table" or type(b) ~= "table" then return false end
+  for _, k in ipairs({"itemID", "itemLevel", "itemSuffix", "battlePetSpeciesID", "battlePetBreedQuality", "battlePetLevel"}) do
+    if (a[k] or 0) ~= (b[k] or 0) then return false end
+  end
+  return true
+end
+
 ---------------------------------------------------------------------------
 -- Where the weights come from
 ---------------------------------------------------------------------------
@@ -60,7 +100,10 @@ function CU.AdjustWeights(w)
   if cfg and cfg.safeMode then return w end
   local _, class = UnitClass("player")
   local spec, levelling = CU.specID, CU.IsLevelling()
-  local key = tostring(w) .. ":" .. tostring(class) .. ":" .. tostring(spec) .. ":" .. tostring(levelling)
+  local parts = {}
+  for k, v in pairs(w) do parts[#parts + 1] = tostring(k) .. "=" .. tostring(v) end
+  table.sort(parts)
+  local key = table.concat(parts, ";") .. ":" .. tostring(class) .. ":" .. tostring(spec) .. ":" .. tostring(levelling)
   if key == adjustedKey then return adjusted end
   local t = {}
   for k, v in pairs(w) do t[k] = v end
@@ -189,6 +232,12 @@ end
 ---------------------------------------------------------------------------
 local function ScoreItem(link, weights)
   if not link then return 0 end
+  local id = type(link) == "number" and link or tonumber(link:match("item:(%d+)"))
+  local cached = not (id and C_Item and C_Item.IsItemDataCachedByID) or C_Item.IsItemDataCachedByID(id)
+  local stats = GetItemStats(link)
+  if not cached or not stats or (not next(stats) and not GetItemInfo(link)) then
+    RequestItem(link); return nil
+  end
   if scoreCache[link] then return scoreCache[link] end
   local total
   if backend == "statpriority" then
@@ -307,24 +356,29 @@ local GROUP_ORDER = { "Head", "Neck", "Shoulder", "Back", "Chest", "Wrist", "Han
                       "Legs", "Feet", "Ring", "Trinket", "Main Hand", "Off Hand", "Ranged" }
 
 -- Returns the score and the hit rating of whatever the new item would replace.
-local function EquippedScore(def, weights)
+local function EquippedScore(def, weights, newScore, newHit, hit)
   local scores, hits = {}, {}
   for i, slot in ipairs(def[2]) do
     local link = GetInventoryItemLink("player", slot)
-    scores[i] = ScoreItem(link, weights) or 0
+    scores[i] = ScoreItem(link, weights)
+    if scores[i] == nil then RequestItem(link); return nil end
     hits[i] = HitRating(link)
   end
   if def[3] == "weakest" then
     local w = 1
-    for i = 2, #scores do if scores[i] < scores[w] then w = i end end
-    return scores[w], hits[w]
+    for i = 2, #scores do
+      if newScore and HitAwareGain(newScore, newHit or 0, scores[i], hits[i], weights, hit)
+          > HitAwareGain(newScore, newHit or 0, scores[w], hits[w], weights, hit)
+        or not newScore and scores[i] < scores[w] then w = i end
+    end
+    return scores[w], hits[w], { def[2][w] }
   end
   if def[3] == "sum" then
     local t, h = 0, 0
     for i = 1, #scores do t, h = t + scores[i], h + hits[i] end
-    return t, h
+    return t, h, def[2]
   end
-  return scores[1], hits[1]
+  return scores[1], hits[1], def[2]
 end
 
 ---------------------------------------------------------------------------
@@ -394,7 +448,13 @@ local function CanUse(link, equipLoc, classID, subID)
   local isArmor = classID == 4 and equipLoc ~= "INVTYPE_CLOAK" and (subID == 6 or (subID >= 1 and subID <= 4))
   if isArmor then
     local _, class = UnitClass("player")
-    local allowed, main = ArmorFor(class, reqLevel) -- by the item's level, so look-ahead works at 39 -> 40
+    -- Proficiency belongs to the player, not to the item's required level.
+    if (class == "WARRIOR" or class == "PALADIN") and subID == 4
+      or (class == "HUNTER" or class == "SHAMAN") and subID == 3 then
+      reqLevel = math.max(reqLevel, 40)
+      if reqLevel > level + cfg.levelLookahead then return false, "armour type at level 40" end
+    end
+    local allowed, main = ArmorFor(class, math.max(level, reqLevel))
     if not allowed[subID] then return false, "can't wear this armour type" end
     if cfg.mainArmorOnly and subID ~= 6 and subID ~= main then
       local extra = CU.ExtraArmor and CU.ExtraArmor[class] and CU.SpecExtraArmor(CU.ExtraArmor[class])
@@ -447,10 +507,30 @@ end
 local function GearScore(weights)
   local t = 0
   for slot = 1, 18 do
-    if slot ~= 4 then t = t + (ScoreItem(GetInventoryItemLink("player", slot), weights) or 0) end -- 4 = shirt
+    if slot ~= 4 then
+      local link = GetInventoryItemLink("player", slot)
+      local score = ScoreItem(link, weights)
+      if score == nil then RequestItem(link); return nil end
+      t = t + score
+    end -- 4 = shirt
   end
   return t
 end
+
+-- The list, planner and breakdown must all quote the same swap.  In particular an
+-- equipped item can have a zero score (and an empty slot is not the same thing), so
+-- never derive the displayed gain from a rank/frontier value.
+local function UpgradeMetrics(it, weights)
+  local old = it.oldScore or 0
+  local raw = (it.score or 0) - old
+  -- Recalculate from the immutable swap inputs.  `rank` is only for Front(), and
+  -- must never become a displayed gain; this also makes a re-render after a hit
+  -- update agree with the breakdown.
+  local gain = HitAwareGain(it.score or 0, it.newHit or HitRating(it.link), old, it.oldHit or 0, weights, CU.HitInfo())
+  local base = GearScore(weights)
+  return gain, base and base > 0 and gain / base * 100 or 0, raw
+end
+CU.UpgradeMetrics = UpgradeMetrics
 
 local function TopTwoSum(list)
   table.sort(list, function(x, y) return x > y end)
@@ -461,6 +541,28 @@ end
 -- ONE option per group. An option can be one item, or two (a pair of rings, main hand + off hand).
 function CU:BuildPlanOptions(weights)
   local pool, hidden, groups = self.lastPool or {}, cfg.hiddenSlots, {}
+  local hit = CU.HitInfo()
+  local function option(items, slots, label)
+    local ns, nh, os, oh, cost, seen = 0, 0, 0, 0, 0, {}
+    for _, it in ipairs(items) do
+      if seen[it.link] then return nil end
+      seen[it.link] = true
+      ns, nh, cost = ns + it.score, nh + (it.newHit or HitRating(it.link)), cost + it.price
+    end
+    for _, slot in ipairs(slots or {}) do
+      local link = GetInventoryItemLink("player", slot)
+      local score = ScoreItem(link, weights)
+      if score == nil then RequestItem(link); return nil end
+      os, oh = os + score, oh + HitRating(link)
+    end
+    local gain = HitAwareGain(ns, nh, os, oh, weights, hit)
+    if gain <= 0 then return nil end
+    return {cost=cost, gain=gain, slot=label, items=items, newScore=ns, newHit=nh, oldScore=os, oldHit=oh}
+  end
+  local function add(opts, items, slots, label)
+    local o = option(items, slots, label)
+    if o then table.insert(opts, o) end
+  end
   local function cands(g)
     if hidden[g] then return {} end
     local out = {}
@@ -471,7 +573,7 @@ function CU:BuildPlanOptions(weights)
   for _, g in ipairs({ "Head", "Neck", "Shoulder", "Back", "Chest", "Wrist", "Hands", "Waist", "Legs", "Feet", "Ranged" }) do
     local opts = {}
     for _, it in ipairs(cands(g)) do
-      table.insert(opts, { cost = it.price, gain = it.gain, slot = g, items = { it } })
+      add(opts, {it}, it.replacedSlots, g)
     end
     if #opts > 0 then table.insert(groups, opts) end
   end
@@ -480,19 +582,14 @@ function CU:BuildPlanOptions(weights)
   -- The best pair keeps whichever two of (new ones + equipped ones) score highest.
   for _, pair in ipairs({ { "Ring", 11, 12 }, { "Trinket", 13, 14 } }) do
     local g = pair[1]
-    local s1 = ScoreItem(GetInventoryItemLink("player", pair[2]), weights) or 0
-    local s2 = ScoreItem(GetInventoryItemLink("player", pair[3]), weights) or 0
     local list, opts = cands(g), {}
     for i, a in ipairs(list) do
-      local one = TopTwoSum({ a.score, s1, s2 }) - (s1 + s2)
-      if one > 0 then table.insert(opts, { cost = a.price, gain = one, slot = g, items = { a } }) end
+      add(opts, {a}, {pair[2]}, g)
+      add(opts, {a}, {pair[3]}, g)
       for j = i + 1, #list do
         local b = list[j]
         if b.link ~= a.link then
-          local two = TopTwoSum({ a.score, b.score, s1, s2 }) - (s1 + s2)
-          if two > one then
-            table.insert(opts, { cost = a.price + b.price, gain = two, slot = g .. "s", items = { a, b } })
-          end
+          add(opts, {a,b}, {pair[2],pair[3]}, g .. "s")
         end
       end
     end
@@ -501,13 +598,13 @@ function CU:BuildPlanOptions(weights)
 
   -- Weapons are one group: a two-hander, a main hand, an off hand, or a main hand + off hand pair.
   local mh, oh, opts = cands("Main Hand"), cands("Off Hand"), {}
-  for _, a in ipairs(mh) do table.insert(opts, { cost = a.price, gain = a.gain, slot = "Main Hand", items = { a } }) end
-  for _, b in ipairs(oh) do table.insert(opts, { cost = b.price, gain = b.gain, slot = "Off Hand", items = { b } }) end
+  for _, a in ipairs(mh) do add(opts, {a}, a.replacedSlots, "Main Hand") end
+  for _, b in ipairs(oh) do add(opts, {b}, b.replacedSlots, "Off Hand") end
   for _, a in ipairs(mh) do
     if a.equipLoc ~= "INVTYPE_2HWEAPON" then
       for _, b in ipairs(oh) do
         if b.link ~= a.link then
-          table.insert(opts, { cost = a.price + b.price, gain = a.gain + b.gain, slot = "Both hands", items = { a, b } })
+          add(opts, {a,b}, {16,17}, "Both hands")
         end
       end
     end
@@ -558,8 +655,38 @@ end
 ---------------------------------------------------------------------------
 local scanFrame = CreateFrame("Frame")
 local quietTimer
+local win -- declared before the slot-search callbacks so they can update an open results window
+
+-- One progress display for both kinds of scan: a bar with a label in the results window
+-- and another on the Auction House tab. frac = 0..1, or nil to hide.
+function CU.SetProgress(frac, text)
+  for _, bar in pairs({ win and win.progressBar, CU.ahProgressBar }) do
+    if bar then
+      if frac then
+        bar:SetMinMaxValues(0, 1); bar:SetValue(math.max(0.02, math.min(frac, 1)))
+        if bar.label then bar.label:SetText(text or "") end
+        bar:Show()
+      else
+        bar:Hide()
+      end
+    end
+  end
+end
+
+local function EndFullScan(reason)
+  CU.fullScanRunning = nil
+  CancelTimer(quietTimer); quietTimer = nil
+  CancelTimer(CU.fullScanRead); CU.fullScanRead = nil
+  if CU.fullScanWatch then CU.fullScanWatch:Cancel(); CU.fullScanWatch = nil end
+  pcall(scanFrame.UnregisterEvent, scanFrame, "REPLICATE_ITEM_LIST_UPDATE")
+  pcall(scanFrame.UnregisterEvent, scanFrame, "AUCTION_HOUSE_CLOSED")
+  CU.SetProgress(nil)
+  if reason then Print(reason) end
+  if CU.updateTabStatus then CU.updateTabStatus() end
+end
 
 function CU:StartScan()
+  if self.slotSearch then Print("A slot search is already running.") return end
   local ah = AuctionHouseFrame
   if not (ah and ah:IsShown()) then Print("Open the Auction House first.") return end
   if not WeightsOrSay() then return end
@@ -570,30 +697,50 @@ function CU:StartScan()
   if left > 0 then
     Print(("Blizzard probably won't allow another full scan for %d:%02d. Trying anyway..."):format(math.floor(left / 60), left % 60))
   end
-  CU.scanPasses = 0
-  Print("Scanning the whole Auction House. This takes up to a minute, and Blizzard only allows it about once every 15 minutes.")
+  if self.fullScanRunning then Print("A full Auction House scan is already running.") return end
   if not pcall(scanFrame.RegisterEvent, scanFrame, "REPLICATE_ITEM_LIST_UPDATE") then
     Print("This client doesn't report full-scan results, so Chupgrades can't scan here.") return
   end
-  C_AuctionHouse.ReplicateItems()
+  local token = {}
+  CU.scanPasses, CU.fullScanRunning = 0, token
+  pcall(scanFrame.RegisterEvent, scanFrame, "AUCTION_HOUSE_CLOSED")
+  Print("Scanning the whole Auction House. This takes up to a minute, and Blizzard only allows it about once every 15 minutes.")
+  CU.SetProgress(0.05, "Full scan: waiting for the Auction House...")
+  -- If Blizzard refuses the scan (the 15-minute limit) no results ever arrive: don't stay
+  -- "running" forever, which would also block slot searches.
+  CU.fullScanWatch = C_Timer.NewTimer(90, function()
+    CU.fullScanWatch = nil
+    if CU.fullScanRunning == token then
+      EndFullScan("The full scan got no results back (Blizzard's 15-minute limit, most likely). Use Search slots meanwhile.")
+    end
+  end)
+  local ok, err = pcall(C_AuctionHouse.ReplicateItems)
+  if not ok then EndFullScan("Full scan stopped: " .. tostring(err)) end
 end
 
 -- Results arrive in bursts; wait until they've been quiet for 3 seconds.
-scanFrame:SetScript("OnEvent", function(self)
+scanFrame:SetScript("OnEvent", function(self, event)
+  local token = CU.fullScanRunning
+  if not token then return end
+  if event == "AUCTION_HOUSE_CLOSED" then EndFullScan("Full scan stopped: the Auction House closed.") return end
   if quietTimer then quietTimer:Cancel() end
   quietTimer = C_Timer.NewTimer(3, function()
+    if CU.fullScanRunning ~= token then return end
     self:UnregisterEvent("REPLICATE_ITEM_LIST_UPDATE")
-    CU:ProcessScan()
+    local ok, err = pcall(CU.ProcessScan, CU, token)
+    if not ok then EndFullScan("Full scan stopped: " .. tostring(err)) end
   end)
 end)
 
 -- Reading the scan. Blizzard's full scan often hands over listings before their item link is
 -- ready. Each pass reads everything it can, asks the game to load what's missing, and tries
--- again (up to SCAN_PASSES x 2 seconds). On the last pass anything still unreadable falls back
--- to the item's plain link (right for most items; "of the X" rolls can't be told apart then).
+-- again (up to SCAN_PASSES x 2 seconds). Unresolved exact links are skipped: a plain base
+-- item's stats must never be attributed to an unknown random variant's buyout.
 local SCAN_PASSES = 15
 
-function CU:ProcessScan()
+function CU:ProcessScan(token)
+  token = token or self.fullScanRunning
+  if not token or self.fullScanRunning ~= token then return end
   local cheapest, n, notReady, fallback, bidOnly = {}, C_AuctionHouse.GetNumReplicateItems(), 0, 0, 0
   local final = (self.scanPasses or 0) >= SCAN_PASSES - 1
   local missingIDs = {}
@@ -601,15 +748,13 @@ function CU:ProcessScan()
     local _, _, count, _, _, _, _, _, _, buyout, _, _, _, _, _, _, itemID = C_AuctionHouse.GetReplicateItemInfo(i)
     if itemID then
       local _, _, _, equipLoc, _, classID, subID = GetItemInfoInstant(itemID)
-      if EQUIP[equipLoc] and (classID == 2 or classID == 4) then
+      if not equipLoc or not classID then
+        notReady = notReady + 1; missingIDs[itemID] = true
+      elseif EQUIP[equipLoc] and (classID == 2 or classID == 4) then
         if not (buyout and buyout > 0) then
           bidOnly = bidOnly + 1
         else
           local link = C_AuctionHouse.GetReplicateItemLink(i)
-          if not link and final then
-            link = select(2, GetItemInfo(itemID))
-            if link then fallback = fallback + 1 end
-          end
           if not link then
             notReady = notReady + 1
             missingIDs[itemID] = true
@@ -624,6 +769,7 @@ function CU:ProcessScan()
     end
   end
   self.scanPasses = (self.scanPasses or 0) + 1
+  CU.SetProgress(0.1 + 0.9 * self.scanPasses / SCAN_PASSES, ("Full scan: reading %d listings..."):format(n))
   if notReady > 0 and self.scanPasses < SCAN_PASSES then
     for id in pairs(missingIDs) do
       if C_Item and C_Item.RequestLoadItemDataByID then pcall(C_Item.RequestLoadItemDataByID, id) end
@@ -631,14 +777,22 @@ function CU:ProcessScan()
     if self.scanPasses == 1 or self.scanPasses % 5 == 0 then
       Print(("Reading the scan: waiting for details on %d listings..."):format(notReady))
     end
-    C_Timer.After(2, function() CU:ProcessScan() end)
+    self.fullScanRead = C_Timer.NewTimer(2, function()
+      if CU.fullScanRunning ~= token then return end
+      local ok, err = pcall(CU.ProcessScan, CU, token)
+      if not ok then EndFullScan("Full scan stopped: " .. tostring(err)) end
+    end)
     return
   end
   self.scanPasses = 0
+  EndFullScan()
+  CancelTimer(self.resultsRetry); self.resultsRetry = nil
+  self.partialScan = notReady > 0
+  self.fullScanComplete = true
   self.lastScan, self.lastScanTime, self.retries, self.summaryShown = cheapest, time(), 0, false
   self.lastScanStats = { listings = n, unread = notReady, fallback = fallback, bidOnly = bidOnly }
   -- Keep it between /reloads and logins: a full scan is only allowed about every 15 minutes.
-  cfg.savedScan = { time = self.lastScanTime, items = cheapest }
+  cfg.savedScan = { time = self.lastScanTime, items = cheapest, full=true, partial=self.partialScan }
   local found = 0
   for _ in pairs(cheapest) do found = found + 1 end
   local extra = {}
@@ -652,12 +806,306 @@ function CU:ProcessScan()
 end
 
 ---------------------------------------------------------------------------
+-- Targeted browse search.  Unlike ReplicateItems this is deliberately small:
+-- browse finds the cheap item keys, then an item query supplies each exact link.
+---------------------------------------------------------------------------
+local slotSearchFrame = CreateFrame("Frame")
+
+local function SlotSearchGroups(groups)
+  local wanted, out = {}, {}
+  for _, g in ipairs(groups or GROUP_ORDER) do
+    if not wanted[g] and (groups or not cfg.hiddenSlots[g]) then
+      wanted[g] = true; table.insert(out, g)
+    end
+  end
+  return wanted, out
+end
+
+local function SlotSearchFilters(wanted)
+  local filters, seen = {}, {}
+  local function add(classID, subClassID)
+    local k = classID .. ":" .. tostring(subClassID or "")
+    if not seen[k] then seen[k] = true; table.insert(filters, { classID = classID, subClassID = subClassID }) end
+  end
+  local _, class = UnitClass("player")
+  local armour, main = ArmorFor(class, UnitLevel("player") + cfg.levelLookahead)
+  local armourSlots = { Head=true, Shoulder=true, Chest=true, Wrist=true, Hands=true, Waist=true, Legs=true, Feet=true }
+  local needArmour = false
+  for g in pairs(wanted) do if armourSlots[g] then needArmour = true end end
+  if needArmour then
+    local extra = CU.ExtraArmor and CU.ExtraArmor[class] and CU.SpecExtraArmor(CU.ExtraArmor[class]) or {}
+    local extras = {}; for _, sub in ipairs(extra) do extras[sub] = true end
+    for sub, allowed in pairs(armour) do
+      if allowed and sub ~= 6 and (not cfg.mainArmorOnly or sub == main or extras[sub]) then add(4, sub) end
+    end
+  end
+  if wanted.Back then add(4, 1) end
+  if wanted.Neck or wanted.Ring or wanted.Trinket or wanted["Off Hand"] then add(4, 0) end
+  if wanted["Off Hand"] and armour[6] then add(4, 6) end
+  if wanted["Main Hand"] or wanted.Ranged or (wanted["Off Hand"] and cfg.dualWield) then add(2) end
+  return filters
+end
+
+function CU:SlotSearchProgress(text)
+  self.slotSearchProgress = text
+  if self.slotSearchButton then self.slotSearchButton:SetText(text) end
+  if self.ahSlotSearchButton then self.ahSlotSearchButton:SetText(text) end
+  local done, total = text:match("Pricing (%d+)/(%d+)")
+  local page = text:match("page (%d+)")
+  if done then
+    CU.SetProgress(0.3 + 0.7 * tonumber(done) / math.max(tonumber(total), 1), ("Looking up rolled items: %s of %s"):format(done, total))
+  else
+    CU.SetProgress(math.min(0.05 * tonumber(page or 1), 0.3), ("Listing gear: page %s"):format(page or 1))
+  end
+  if self.updateTabStatus then self.updateTabStatus() end
+end
+
+function CU:FinishSlotSearch(reason)
+  local s = self.slotSearch
+  if not s then return end
+  self.slotSearch = nil
+  if s.timer then s.timer:Cancel() end
+  slotSearchFrame:UnregisterEvent("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+  slotSearchFrame:UnregisterEvent("AUCTION_HOUSE_BROWSE_RESULTS_ADDED")
+  slotSearchFrame:UnregisterEvent("ITEM_SEARCH_RESULTS_UPDATED")
+  pcall(slotSearchFrame.UnregisterEvent, slotSearchFrame, "ITEM_SEARCH_RESULTS_ADDED")
+  slotSearchFrame:UnregisterEvent("AUCTION_HOUSE_THROTTLED_SYSTEM_READY")
+  slotSearchFrame:UnregisterEvent("AUCTION_HOUSE_CLOSED")
+  if self.slotSearchButton then self.slotSearchButton:Enable(); self.slotSearchButton:SetText("Search shown slots") end
+  if self.ahSlotSearchButton then self.ahSlotSearchButton:Enable(); self.ahSlotSearchButton:SetText("Search slots") end
+  CU.SetProgress(nil)
+  self.slotSearchProgress = nil
+  if reason then Print("Slot search stopped: " .. reason) else
+    self.searchedGroups = self.searchedGroups or {}
+    for _, g in ipairs(s.groups or {}) do self.searchedGroups[g] = true end
+    local old = {}
+    for link,a in pairs(self.lastScan or {}) do old[link]=a end
+    for link, a in pairs(old) do
+      local def = EQUIP[a.equipLoc]
+      if def and s.wanted[def[1]] and not s.partial then old[link] = nil end
+    end
+    for link, a in pairs(s.cheapest) do old[link] = a end
+    CancelTimer(self.resultsRetry); self.resultsRetry = nil
+    self.partialScan = self.partialScan or s.partial or false
+    self.lastScan, self.lastScanTime, self.retries, self.summaryShown = old, time(), 0, false
+    cfg.savedScan = { time = self.lastScanTime, items = old, partial=self.partialScan, groups=self.searchedGroups }
+    local pieces = 0; for _ in pairs(s.cheapest) do pieces = pieces + 1 end
+    Print(("Slot search done: %d listings checked, %d pieces for %s."):format(s.listings, pieces, table.concat(s.groups, ", ")))
+    if s.partial then Print(("Partial search: %d capped, %d timed-out and %d unread lookups. Previous listings retained; prices may be stale."):format(s.skipped or 0, s.timeouts or 0, s.unread or 0)) end
+    self:BuildResults()
+  end
+  if self.updateTabStatus then self.updateTabStatus() end
+end
+
+local function SlotSearchLater(s, seconds, fn)
+  if s.timer then s.timer:Cancel() end
+  s.timer = C_Timer.NewTimer(seconds, function()
+    if CU.slotSearch == s then
+      local ok, err = pcall(fn)
+      if not ok then CU:FinishSlotSearch(tostring(err)) end
+    end
+  end)
+end
+
+local function SlotSearchSend(s, fn)
+  if CU.slotSearch ~= s or type(fn) ~= "function" then return end
+  if type(C_AuctionHouse.IsThrottledMessageSystemReady) == "function" and not C_AuctionHouse.IsThrottledMessageSystemReady() then
+    s.throttleSince = s.throttleSince or GetTime()
+    if GetTime() - s.throttleSince >= 20 then return CU:FinishSlotSearch("Auction House remained throttled; previous results kept") end
+    s.waitingThrottle = fn
+    SlotSearchLater(s, .5, function() local f = s.waitingThrottle; s.waitingThrottle = nil; SlotSearchSend(s, f) end)
+    return
+  end
+  s.throttleSince, s.waitingThrottle = nil, nil
+  local ok, err = pcall(fn)
+  if not ok then CU:FinishSlotSearch(tostring(err)) end
+end
+
+local function SlotSearchPriceNext(s)
+  if CU.slotSearch ~= s then return end
+  CancelTimer(s.timer)
+  s.index = s.index + 1
+  if s.index > #s.needsSearch then return CU:FinishSlotSearch() end
+  local row = s.needsSearch[s.index]
+  s.current = row
+  CU:SlotSearchProgress(("Pricing %d/%d"):format(s.index, #s.needsSearch))
+  if s.index == 1 or s.index % 25 == 0 then Print(("Priced %d/%d..."):format(s.index - 1, #s.needsSearch)) end
+  s.searches = s.searches + 1
+  local status
+  if type(C_AuctionHouse.GetItemCommodityStatus) == "function" then
+    local ok, value = pcall(C_AuctionHouse.GetItemCommodityStatus, row.itemKey)
+    if ok then status = value end
+  end
+  if status and Enum and Enum.ItemCommodityStatus and status == Enum.ItemCommodityStatus.Commodity then
+    s.partial = true
+    return SlotSearchPriceNext(s)
+  end
+  local function send()
+    if C_AuctionHouse.GetItemKeyInfo and not C_AuctionHouse.GetItemKeyInfo(row.itemKey) then
+      row.waitSince = row.waitSince or GetTime()
+      RequestItem(row.itemKey.itemID)
+      if GetTime() - row.waitSince < 8 then return SlotSearchLater(s, .5, function() SlotSearchSend(s, send) end) end
+      s.partial=true; s.timeouts=(s.timeouts or 0)+1; return SlotSearchPriceNext(s)
+    end
+    SlotSearchLater(s, 8, function() s.partial=true; s.timeouts=(s.timeouts or 0)+1; SlotSearchPriceNext(s) end)
+    C_AuctionHouse.SendSearchQuery(row.itemKey, { { sortOrder = Enum.AuctionHouseSortOrder.Buyout, reverseSort = false } }, true)
+  end
+  SlotSearchSend(s, send)
+end
+
+local function SlotSearchBrowseNext(s)
+  s.query = s.query + 1
+  if s.query > #s.queries then
+    table.sort(s.candidates, function(a, b) return (a.minPrice or math.huge) < (b.minPrice or math.huge) end)
+    s.needsSearch = {}
+    local instant = 0
+    for _, row in ipairs(s.candidates) do
+      local suffix = row.itemKey.itemSuffix
+      local link = select(2, GetItemInfo(row.itemKey.itemID))
+      local quality = select(3, GetItemInfo(row.itemKey.itemID))
+      -- White and grey items never have a random roll, so their plain link is exact too.
+      local fixed = (not suffix or suffix == 0) and link and quality and quality < 2
+      if fixed and row.minPrice then
+        s.cheapest[link] = { price=row.minPrice, equipLoc=row.equipLoc, classID=row.classID, subID=row.subID }
+        instant = instant + 1
+      else
+        table.insert(s.needsSearch, row)
+      end
+    end
+    -- Look up the strongest items first: higher item level means bigger rolled stats, so real
+    -- upgrades are priced before cheap low-level ones use up the lookup limit.
+    table.sort(s.needsSearch, function(a, b)
+      local la, lb = a.itemKey.itemLevel or 0, b.itemKey.itemLevel or 0
+      if la ~= lb then return la > lb end
+      return (a.minPrice or math.huge) < (b.minPrice or math.huge)
+    end)
+    local cap = cfg.searchCap or 200
+    local skipped = math.max(0, #s.needsSearch - cap)
+    if skipped > 0 then s.partial=true; s.skipped=skipped end
+    while #s.needsSearch > cap do table.remove(s.needsSearch) end
+    Print(("Found %d items: %d priced instantly, looking up %d rolled items%s..."):format(#s.candidates, instant, #s.needsSearch,
+      skipped > 0 and ("; skipped the " .. skipped .. " lowest-level ones (/cu searchcap raises the limit)") or ""))
+    s.index, s.phase = 0, "price"; return SlotSearchPriceNext(s)
+  end
+  s.page, s.phase = 1, "browse"; CU:SlotSearchProgress("Listing... page 1")
+  SlotSearchSend(s, function()
+    C_AuctionHouse.SendBrowseQuery(s.queries[s.query])
+    SlotSearchLater(s, 8, function() s.partial=true; SlotSearchBrowseNext(s) end)
+  end)
+end
+
+function CU:StartSlotSearch(groups)
+  if self.fullScanRunning then Print("A full Auction House scan is already running.") return end
+  if self.slotSearch then Print("A slot search is already running.") return end
+  if not (AuctionHouseFrame and AuctionHouseFrame:IsShown()) then Print("Open the Auction House first.") return end
+  local weights = WeightsOrSay()
+  if not weights then return end
+  if not (C_AuctionHouse and C_AuctionHouse.SendBrowseQuery and C_AuctionHouse.SendSearchQuery) then Print("This client doesn't allow Auction House browse searches.") return end
+  local wanted, chosen = SlotSearchGroups(groups)
+  if #chosen == 0 then Print("No shown slots to search.") return end
+  local filters = SlotSearchFilters(wanted)
+  if #filters == 0 then Print("No usable item classes for those slots.") return end
+  local level = UnitLevel("player") + cfg.levelLookahead
+  -- Skip gear far below your level: it fills the results with tiny upgrades. /cu floor changes it.
+  local minLevel = math.max(0, UnitLevel("player") - (cfg.searchFloor or 10))
+  local query = { searchString="", minLevel=minLevel, maxLevel=level, filters={}, itemClassFilters=filters,
+    sorts={ { sortOrder=Enum.AuctionHouseSortOrder.Price, reverseSort=false } } }
+  local s = { wanted=wanted, groups=chosen, queries={query}, query=0, page=0, candidates={}, seen={}, cheapest={}, listings=0, index=0, searches=0, weights=weights }
+  self.slotSearch = s
+  slotSearchFrame:RegisterEvent("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+  slotSearchFrame:RegisterEvent("AUCTION_HOUSE_BROWSE_RESULTS_ADDED")
+  slotSearchFrame:RegisterEvent("ITEM_SEARCH_RESULTS_UPDATED")
+  pcall(slotSearchFrame.RegisterEvent, slotSearchFrame, "ITEM_SEARCH_RESULTS_ADDED")
+  slotSearchFrame:RegisterEvent("AUCTION_HOUSE_THROTTLED_SYSTEM_READY")
+  slotSearchFrame:RegisterEvent("AUCTION_HOUSE_CLOSED")
+  if self.slotSearchButton then self.slotSearchButton:Disable() end
+  if self.ahSlotSearchButton then self.ahSlotSearchButton:Disable() end
+  Print(("Searching %s: gear for levels %d-%d..."):format(table.concat(chosen, ", "), minLevel, level))
+  SlotSearchBrowseNext(s)
+end
+
+local function SlotSearchEvent(_, event, itemKey)
+  local s = CU.slotSearch; if not s then return end
+  if event == "AUCTION_HOUSE_CLOSED" then return CU:FinishSlotSearch("the Auction House closed") end
+  if event == "AUCTION_HOUSE_THROTTLED_SYSTEM_READY" and s.waitingThrottle then
+    local f = s.waitingThrottle; s.waitingThrottle = nil; return SlotSearchSend(s, f)
+  end
+  -- Only listen to the phase we're in: other addons and the AH's own browse list fire these
+  -- events too, and a stray browse update while pricing used to restart the whole search.
+  if (event == "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED" or event == "AUCTION_HOUSE_BROWSE_RESULTS_ADDED") and s.phase == "browse" then
+    local rows = type(C_AuctionHouse.GetBrowseResults) == "function" and C_AuctionHouse.GetBrowseResults() or {}
+    s.listings = #rows -- browse results are cumulative across pages
+    for _, row in ipairs(rows) do
+      local key, id = row.itemKey, row.itemKey and row.itemKey.itemID
+      local loc, classID, subID
+      if id then _, _, _, loc, _, classID, subID = GetItemInfoInstant(id) end
+      local def = loc and EQUIP[loc]
+      local _, _, _, _, req = id and GetItemInfo(id)
+      if not id or not loc or not classID then
+        s.partial=true
+        s.unreadIDs=s.unreadIDs or {}
+        local unreadKey=id or tostring(row)
+        if not s.unreadIDs[unreadKey] then
+          s.unreadIDs[unreadKey]=true; s.unread=(s.unread or 0)+1
+          RequestItem(id)
+        end
+      elseif key and def and s.wanted[def[1]] and (not req or req <= UnitLevel("player") + cfg.levelLookahead) then
+        local k = table.concat({ tostring(id), tostring(key.itemLevel or ""), tostring(key.itemSuffix or ""),
+          tostring(key.battlePetSpeciesID or ""), tostring(key.battlePetBreedQuality or ""), tostring(key.battlePetLevel or "") }, ":")
+        if not s.seen[k] then s.seen[k] = true; table.insert(s.candidates, { itemKey=key, minPrice=row.minPrice, equipLoc=loc, classID=classID, subID=subID }) end
+      end
+    end
+    if s.timer then s.timer:Cancel() end
+    if type(C_AuctionHouse.HasFullBrowseResults) == "function" and not C_AuctionHouse.HasFullBrowseResults() then
+      s.page = s.page + 1; CU:SlotSearchProgress("Listing... page " .. s.page)
+      return SlotSearchSend(s, function()
+        SlotSearchLater(s, 8, function() s.partial=true; s.timeouts=(s.timeouts or 0)+1; SlotSearchBrowseNext(s) end)
+        C_AuctionHouse.RequestMoreBrowseResults()
+      end)
+    end
+    return SlotSearchBrowseNext(s)
+  end
+  if (event == "ITEM_SEARCH_RESULTS_UPDATED" or event == "ITEM_SEARCH_RESULTS_ADDED") and s.phase == "price" then
+    local row = s.current
+    if not row or not SameKey(itemKey, row.itemKey) then return end
+    if s.timer then s.timer:Cancel() end
+    local n = C_AuctionHouse.GetNumItemSearchResults(row.itemKey) or 0
+    for i = 1, n do
+      local info = C_AuctionHouse.GetItemSearchResultInfo(row.itemKey, i)
+      if info and info.itemLink and info.buyoutAmount and info.buyoutAmount > 0 then
+        local old = s.cheapest[info.itemLink]
+        if not old or info.buyoutAmount < old.price then s.cheapest[info.itemLink] = { price=info.buyoutAmount, equipLoc=row.equipLoc, classID=row.classID, subID=row.subID } end
+      end
+    end
+    if C_AuctionHouse.HasFullItemSearchResults and not C_AuctionHouse.HasFullItemSearchResults(row.itemKey) then
+      if not C_AuctionHouse.RequestMoreItemSearchResults then s.partial=true; return SlotSearchPriceNext(s) end
+      return SlotSearchSend(s, function()
+        SlotSearchLater(s, 8, function() s.partial=true; s.timeouts=(s.timeouts or 0)+1; SlotSearchPriceNext(s) end)
+        C_AuctionHouse.RequestMoreItemSearchResults(row.itemKey)
+      end)
+    end
+    return SlotSearchPriceNext(s)
+  end
+end
+slotSearchFrame:SetScript("OnEvent", function(...)
+  local ok, err = pcall(SlotSearchEvent, ...)
+  if not ok then CU:FinishSlotSearch(tostring(err)) end
+end)
+
+---------------------------------------------------------------------------
 -- Build and show results
 ---------------------------------------------------------------------------
 function CU:BuildResults()
+  CancelTimer(self.resultsRetry); self.resultsRetry = nil
   local weights = WeightsOrSay()
   if not weights then return end
   if not self.lastScan then Print("No scan yet: open the Auction House and click Chupgrades.") return end
+  -- A replicated/full scan is a search of every equipment group.  Targeted searches
+  -- mark just their requested groups in FinishSlotSearch.
+  if self.fullScanComplete then
+    self.searchedGroups = self.searchedGroups or {}
+    for _, g in ipairs(GROUP_ORDER) do self.searchedGroups[g] = true end
+  end
 
   local mhID  = GetInventoryItemID("player", 16)
   local mhLoc = mhID and select(4, GetItemInfoInstant(mhID))
@@ -665,48 +1113,51 @@ function CU:BuildResults()
   for _ in pairs(self.lastScan) do total = total + 1 end
 
   local ohLink = GetInventoryItemLink("player", 17)
-  local ohScore, ohHit = ScoreItem(ohLink, weights) or 0, HitRating(ohLink)
+  local ohScore, ohHit = ScoreItem(ohLink, weights), HitRating(ohLink)
   local hit = CU.HitInfo()
 
   for link, a in pairs(self.lastScan) do
     local def = EQUIP[a.equipLoc]
-    local skip =
+    local skip = not def or
       (def[1] == "Off Hand" and mhLoc == "INVTYPE_2HWEAPON")            -- no off-hands with a two-hander
       or (a.equipLoc == "INVTYPE_WEAPONOFFHAND" and not cfg.dualWield)   -- off-hand weapons need dual wield
     if not skip then
       local ok, reqLevel = CanUse(link, a.equipLoc, a.classID, a.subID)
       if ok == nil then
         loading = loading + 1
-        if C_Item and C_Item.RequestLoadItemDataByID then pcall(C_Item.RequestLoadItemDataByID, link) end
+        RequestItem(link)
       elseif ok then
         usable = usable + 1
         local new = ScoreItem(link, weights)
-        if new == nil then loading = loading + 1 end
+        if new == nil then loading = loading + 1; RequestItem(link) end
         if new then
           -- Which slot(s) to compare against. With dual wield on, a one-hander is checked
           -- against your main hand AND your off hand, and can show up under both.
-          local oldScore, oldHit = EquippedScore(def, weights)
+          local newHit = HitRating(link)
+          local oldScore, oldHit, replacedSlots = EquippedScore(def, weights, new, newHit, hit)
           local hasItem = false
           for _, slot in ipairs(def[2]) do if GetInventoryItemLink("player", slot) then hasItem = true end end
-          local targets = { { def[1], oldScore, oldHit, hasItem } }
-          local newHit = HitRating(link)
+          local targets = { { def[1], oldScore, oldHit, hasItem, replacedSlots } }
           if cfg.dualWield and a.equipLoc == "INVTYPE_WEAPON" and mhLoc ~= "INVTYPE_2HWEAPON" then
-            table.insert(targets, { "Off Hand", ohScore, ohHit, ohLink ~= nil })
+            table.insert(targets, { "Off Hand", ohScore, ohHit, ohLink ~= nil, {17} })
           end
           for _, t in ipairs(targets) do
             local group, old = t[1], t[2]
+            if old == nil then loading = loading + 1
+            else
             local empty = old <= 0
             local gain, wasted = HitAwareGain(new, newHit, old, t[3], weights, hit)
             local pct = empty and 0 or gain / old * 100
-            if (empty and new > 0) or pct >= cfg.minUpgradePct then
+            if gain > 0 and (empty or pct >= cfg.minUpgradePct) then
               groups[group] = groups[group] or {}
               table.insert(groups[group], {
                 link = link, price = a.price, upgradePct = pct, empty = empty, group = group, oldScore = old,
-                slotHasItem = t[4],
+                slotHasItem = t[4], oldHit = t[3], newHit = newHit, replacedSlots=t[5],
                 rank = empty and (1e6 + new) or pct, reqLevel = reqLevel,
-                score = new, gain = empty and new or gain, equipLoc = a.equipLoc, hitWasted = wasted,
+                score = new, gain = gain, equipLoc = a.equipLoc, hitWasted = wasted,
                 quality = select(3, GetItemInfo(link)), setID = select(16, GetItemInfo(link)),
               })
+            end
             end
           end
         end
@@ -718,7 +1169,11 @@ function CU:BuildResults()
   if loading > 0 and (self.retries or 0) < 8 then
     self.retries = (self.retries or 0) + 1
     if self.retries == 1 then Print(("Waiting for details on %d items..."):format(loading)) end
-    C_Timer.After(2, function() CU:BuildResults() end)
+    local snapshot = self.lastScan
+    self.resultsRetry = C_Timer.NewTimer(2, function()
+      self.resultsRetry = nil
+      if self.lastScan == snapshot then self:BuildResults() end
+    end)
   elseif not self.summaryShown then
     local upgrades = 0
     for _, items in pairs(groups) do upgrades = upgrades + #items end
@@ -835,6 +1290,8 @@ local function MakeTextView(parent, onClick)
   function view:AddMessage(text) table.insert(self.lines, text or "") end
   function view:Clear() wipe(self.lines) end
   function view:SetPoint(...) sf:SetPoint(...) end
+  function view:Show() sf:Show() end
+  function view:Hide() sf:Hide() end
   function view:Done()
     local width = sf:GetWidth()
     if width and width > 50 then html:SetWidth(width - 4) end
@@ -849,7 +1306,8 @@ local function MakeTextView(parent, onClick)
     html:SetText("<html><body>" .. table.concat(parts) .. "</body></html>")
     local h = html.GetContentHeight and html:GetContentHeight()
     html:SetHeight(math.max(type(h) == "number" and h or (#self.lines * 14), 10))
-    sf:SetVerticalScroll(0)
+    local oldScroll = sf:GetVerticalScroll() or 0
+    sf:SetVerticalScroll(math.max(0, math.min(oldScroll, math.max(0, html:GetHeight() - sf:GetHeight()))))
   end
   return view
 end
@@ -857,6 +1315,9 @@ end
 local function Money(copper)
   copper = math.floor(copper + 0.5)
   return GetMoneyString and GetMoneyString(copper, true) or GetCoinTextureString(copper)
+end
+local function MoneyInput(copper)
+  return ("%dg %ds %dc"):format(math.floor(copper/10000),math.floor(copper/100)%100,copper%100)
 end
 
 -- Short "+5 AP, +3 Sta" text for the stats an item actually has, so rolled stats ("of Power",
@@ -916,7 +1377,7 @@ local function WearingText(group)
     local link = GetInventoryItemLink("player", slot)
     if link then
       local sum = StatSummary(link)
-      table.insert(bits, sum ~= "" and sum or "no useful stats")
+      table.insert(bits, link .. " |cff999999(" .. (sum ~= "" and sum or "no useful stats") .. ")|r")
     else
       table.insert(bits, "nothing")
     end
@@ -928,11 +1389,13 @@ local function SearchInAuctionator(names)
   local api = Auctionator and Auctionator.API and Auctionator.API.v1
   if not (api and api.MultiSearchExact) then Print("Auctionator isn't loaded.") return end
   if not (AuctionHouseFrame and AuctionHouseFrame:IsShown()) then Print("Open the Auction House first.") return end
-  api.MultiSearchExact("Chupgrades", names)
+  if CU.slotSearch or CU.fullScanRunning then Print("Finish or stop the current scan before searching in Auctionator.") return end
+  local ok, err = pcall(api.MultiSearchExact, "Chupgrades", names)
+  if not ok then Print("Auctionator search failed: " .. tostring(err)) end
 
 end
 
-local win, GetWindow -- defined further down; declared here so the breakdown code can use them
+local GetWindow -- defined further down; declared here so the breakdown code can use it
 
 -- Choosing the spec to score for (from the results window or the Auction House tab).
 -- "auto" follows StatPriority. Scans hold every piece of gear for sale whatever your spec,
@@ -1027,9 +1490,10 @@ end
 -- The equipped item(s) a candidate would replace, matching how it was compared.
 local function ReplacedLinks(it, weights)
   local def = EQUIP[it.equipLoc]
-  local slots = (it.group == "Off Hand") and { 17 } or def[2]
+  if not def then return {} end
+  local slots = it.replacedSlots or ((it.group == "Off Hand") and { 17 } or def[2])
   local links = {}
-  if def[3] == "weakest" and it.group ~= "Off Hand" then
+  if not it.replacedSlots and def[3] == "weakest" and it.group ~= "Off Hand" then
     local best, bestScore
     for _, slot in ipairs(slots) do
       local l = GetInventoryItemLink("player", slot)
@@ -1054,14 +1518,13 @@ function CU.ShowBreakdownHelp()
   bd:Clear()
   bd:AddMessage("|cffffd100Breakdown|r")
   bd:AddMessage(" ")
-  bd:AddMessage("Click an item on the left to see how it was scored: each stat, what it's worth to you, and the weighted % increase.")
-  bd:AddMessage(" ")
-  bd:AddMessage("|cffff8800Items that \"may vary in stats\"|r (names like \"...of Power\") come in versions with different stats."
-    .. " The Auction House search row only shows the plain version. Buy the listing whose stats match the ones shown here.")
+  bd:AddMessage("What you're wearing")
+  for _, group in ipairs(GROUP_ORDER) do bd:AddMessage(("|cff999999%s:|r %s"):format(group, WearingText(group))) end
   bd:Done()
 end
 
 function CU:ShowBreakdown(it)
+  self.bdLink, self.bdGroup = it.link, it.group
   local w = GetWindow()
   local bd = w.breakdown
   local weights = lastWeights
@@ -1111,16 +1574,15 @@ function CU:ShowBreakdown(it)
   end
   bd:AddMessage(" ")
 
-  local raw = (it.score or 0) - (it.oldScore or 0)
-  local hitAdj = (it.gain or raw) - raw
+  local gain, overall, raw = UpgradeMetrics(it, weights)
+  local hitAdj = gain - raw
   bd:AddMessage(("This item scores |cffffffff%.2f|r, what you wear scores |cffffffff%.2f|r."):format(it.score or 0, it.oldScore or 0))
   if math.abs(hitAdj) > 0.005 then
     bd:AddMessage(("Hit cap adjustment: %s%s|r %s"):format(hitAdj < 0 and "|cffff6060" or "|cff00ff00", Signed(hitAdj, "%.2f"),
       hitAdj < 0 and "(hit past your cap, or dropping below it, isn't worth full value)" or ""))
   end
-  local gearBase = GearScore(weights)
-  local overall = gearBase > 0 and ((it.gain or raw) / gearBase * 100) or 0
-  bd:AddMessage(("Gain: |cff00ff00%s points|r out of your total gear score of %.1f"):format(Signed(it.gain or raw, "%.2f"), gearBase))
+  local gearBase = GearScore(weights) or 0
+  bd:AddMessage(("Gain: |cff00ff00%s points|r out of your total gear score of %.1f"):format(Signed(gain, "%.2f"), gearBase))
   bd:AddMessage(("Weighted increase: |cff00ff00%s%% overall|r  (%.2f%% per gold)"):format(Signed(overall, "%.1f"),
     overall / math.max((it.price or 0) / 10000, 1)))
   if it.reqLevel and it.reqLevel > UnitLevel("player") then
@@ -1132,245 +1594,25 @@ function CU:ShowBreakdown(it)
   bd:Done()
 end
 
-function GetWindow()
-  if win then return win end
-  win = CreateFrame("Frame", "ChupgradesFrame", UIParent, "BasicFrameTemplateWithInset")
-  win:SetSize(990, 440)
-  win:SetPoint("CENTER")
-  win:SetMovable(true)
-  win:EnableMouse(true)
-  win:RegisterForDrag("LeftButton")
-  win:SetScript("OnDragStart", win.StartMoving)
-  win:SetScript("OnDragStop", win.StopMovingOrSizing)
-  win:SetFrameStrata("HIGH")
-  if win.TitleText then win.TitleText:SetText("Chupgrades") end
-  tinsert(UISpecialFrames, "ChupgradesFrame") -- Escape closes it
 
-  -- Slot filter: a tickbox per slot. Ticked = shown. Shift-click a slot to show ONLY that slot.
-  win.filterButtons, win.filterLabels = {}, {}
-  local colW, rowH, x0, y0 = 76, 22, 14, -30
-  for i, g in ipairs(GROUP_ORDER) do
-    local row, col = math.floor((i - 1) / 8), (i - 1) % 8
-    local cb = CreateFrame("CheckButton", nil, win, "UICheckButtonTemplate")
-    cb:SetSize(20, 20)
-    cb:SetPoint("TOPLEFT", x0 + col * colW, y0 - row * rowH)
-    local label = win:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    label:SetPoint("LEFT", cb, "RIGHT", 1, 0)
-    label:SetText(g)
-    cb:SetHitRectInsets(0, -(colW - 24), 0, 0) -- clicking the name toggles it too
-    cb:SetScript("OnClick", function(self)
-      if IsShiftKeyDown() then
-        for _, other in ipairs(GROUP_ORDER) do cfg.hiddenSlots[other] = true end
-        cfg.hiddenSlots[g] = nil
-      else
-        cfg.hiddenSlots[g] = (not self:GetChecked()) or nil
-      end
-      CU:Render()
-    end)
-    win.filterButtons[g], win.filterLabels[g] = cb, label
+-- Biggest upgrade first; of several items with exactly the same useful stats (e.g. five
+-- "+3 Stamina" cloaks that differ only in a resistance you don't value) keep the cheapest.
+local function DistinctByStats(items)
+  local sorted = {}
+  for i, it in ipairs(items) do sorted[i] = it end
+  table.sort(sorted, function(a, b)
+    if a.gain ~= b.gain then return a.gain > b.gain end
+    return a.price < b.price
+  end)
+  local out, seen = {}, {}
+  for _, it in ipairs(sorted) do
+    local key = StatSummary(it.link)
+    if key == "" then key = it.link end
+    if not seen[key] then seen[key] = true; table.insert(out, it) end
   end
-  -- Third row: item quality tickboxes and the set-piece filter.
-  local qLabel = win:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  qLabel:SetPoint("TOPLEFT", x0 + 2, y0 - 2 * rowH - 6)
-  qLabel:SetText("Quality:")
-  win.qualityChecks = {}
-  local qx = x0 + 52
-  for q = 0, 4 do
-    local cb = CreateFrame("CheckButton", nil, win, "UICheckButtonTemplate")
-    cb:SetSize(20, 20)
-    cb:SetPoint("TOPLEFT", qx, y0 - 2 * rowH - 2)
-    local label = win:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    label:SetPoint("LEFT", cb, "RIGHT", 1, 0)
-    label:SetText("|cff" .. QUALITY_HEX[q] .. QUALITY_NAMES[q] .. "|r")
-    cb:SetHitRectInsets(0, -62, 0, 0)
-    cb:SetScript("OnClick", function(self)
-      cfg.hiddenQuality[q] = (not self:GetChecked()) or nil
-      CU:Render()
-    end)
-    win.qualityChecks[q] = cb
-    qx = qx + 86 -- wide enough for "Uncommon"
-  end
-  local setBtn = CreateFrame("Button", nil, win, "UIPanelButtonTemplate")
-  setBtn:SetSize(120, 20)
-  setBtn:SetPoint("TOPLEFT", qx + 4, y0 - 2 * rowH - 2)
-  setBtn:SetNormalFontObject(GameFontHighlightSmall)
-  setBtn:SetHighlightFontObject(GameFontHighlightSmall)
-  setBtn:SetScript("OnClick", function()
-    cfg.setFilter = ({ any = "only", only = "none", none = "any" })[cfg.setFilter] or "only"
-    CU:Render()
-  end)
-  win.setButton = setBtn
-
-  -- Fourth row: which spec to score for. "Auto" follows StatPriority's detected spec.
-  local sLabel = win:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  sLabel:SetPoint("TOPLEFT", x0 + 2, y0 - 3 * rowH - 6)
-  sLabel:SetText("Spec:")
-  CU.MakeSpecRow(win, "TOPLEFT", win, "TOPLEFT", x0 + 52, y0 - 3 * rowH - 2)
-
-  -- Last spot on the second row: All / None.
-  local function SmallButton(text, x, onClick)
-    local b = CreateFrame("Button", nil, win, "UIPanelButtonTemplate")
-    b:SetSize(36, 18)
-    b:SetPoint("TOPLEFT", x, y0 - rowH - 1)
-    b:SetText(text)
-    b:SetNormalFontObject(GameFontHighlightSmall)
-    b:SetHighlightFontObject(GameFontHighlightSmall)
-    b:SetScript("OnClick", onClick)
-    return b
-  end
-  SmallButton("All", x0 + 7 * colW, function() wipe(cfg.hiddenSlots); CU:Render() end)
-  SmallButton("None", x0 + 7 * colW + 38, function()
-    for _, g in ipairs(GROUP_ORDER) do cfg.hiddenSlots[g] = true end
-    CU:Render()
-  end)
-
-  -- Dual wield toggle.
-  local dw = CreateFrame("CheckButton", nil, win, "UICheckButtonTemplate")
-  dw:SetSize(24, 24)
-  dw:SetPoint("BOTTOMLEFT", 10, 8)
-  local dwLabel = win:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  dwLabel:SetPoint("LEFT", dw, "RIGHT", 2, 0)
-  dwLabel:SetText("Dual wield")
-  dw:SetScript("OnClick", function(self)
-    cfg.dualWield = self:GetChecked() and true or false
-    CU.retries = 0
-    CU:BuildResults()
-  end)
-  win.dualWieldCheck = dw
-
-  local all = CreateFrame("CheckButton", nil, win, "UICheckButtonTemplate")
-  all:SetSize(24, 24)
-  all:SetPoint("BOTTOMLEFT", 10, 40)
-  local allLabel = win:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  allLabel:SetPoint("LEFT", all, "RIGHT", 2, 0)
-  allLabel:SetText("Show every upgrade, not just the best value")
-  all:SetScript("OnClick", function(self)
-    cfg.showAll = self:GetChecked() and true or false
-    CU:Render()
-  end)
-  win.showAllParts = { all, allLabel }
-  win.showAllCheck = all
-
-  -- Switch between the per-slot list and the shopping plan.
-  local view = CreateFrame("Button", nil, win, "UIPanelButtonTemplate")
-  view:SetSize(150, 22)
-  view:SetPoint("BOTTOMLEFT", 130, 10)
-  view:SetScript("OnClick", function()
-    cfg.view = (cfg.view == "plan") and "list" or "plan"
-    CU:Render()
-  end)
-  win.viewButton = view
-
-  -- Plan view: gold / silver / copper boxes for the budget and for money to keep back.
-  -- Type the amounts, press Enter or Tab (or click away). Escape puts back what was there.
-  local COIN = {
-    "|TInterface\\MoneyFrame\\UI-GoldIcon:0:0:2:0|t",
-    "|TInterface\\MoneyFrame\\UI-SilverIcon:0:0:2:0|t",
-    "|TInterface\\MoneyFrame\\UI-CopperIcon:0:0:2:0|t",
-  }
-  local function MoneyBoxes(labelText, x, get, set)
-    local parts, boxes = {}, {}
-    local label = win:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    label:SetPoint("BOTTOMLEFT", x, 48)
-    label:SetText(labelText)
-    table.insert(parts, label)
-    local anchor, gap = label, 10
-    local function read()
-      local any, total = false, 0
-      for i, b in ipairs(boxes) do
-        local n = tonumber((b:GetText() or ""):match("%d+"))
-        if n then any = true; total = total + n * ({ 10000, 100, 1 })[i] end
-      end
-      return any and total or nil
-    end
-    local function refresh()
-      for _, b in ipairs(boxes) do if b:HasFocus() then return end end
-      local v = get()
-      local values = v and { math.floor(v / 10000), math.floor(v / 100) % 100, v % 100 } or { "", "", "" }
-      for i, b in ipairs(boxes) do b:SetText(tostring(values[i])) end
-    end
-    for i = 1, 3 do
-      local box = CreateFrame("EditBox", nil, win, "InputBoxTemplate")
-      box:SetSize(i == 1 and 40 or 26, 20)
-      box:SetPoint("LEFT", anchor, "RIGHT", gap, 0)
-      box:SetAutoFocus(false)
-      box:SetNumeric(true)
-      box:SetMaxLetters(i == 1 and 6 or 2)
-      local coin = win:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-      coin:SetPoint("LEFT", box, "RIGHT", 1, 0)
-      coin:SetText(COIN[i])
-      box:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
-      box:SetScript("OnTabPressed", function(self)
-        local nextBox = boxes[i % 3 + 1]
-        self:ClearFocus(); nextBox:SetFocus(); nextBox:HighlightText()
-      end)
-      box:SetScript("OnEditFocusLost", function()
-        C_Timer.After(0, function() -- after focus has moved, in case it moved to a sibling box
-          for _, b in ipairs(boxes) do if b:HasFocus() then return end end
-          set(read()); CU:Render()
-        end)
-      end)
-      box:SetScript("OnEscapePressed", function(self)
-        for _, b in ipairs(boxes) do b:ClearFocus() end
-        refresh()
-      end)
-      table.insert(boxes, box); table.insert(parts, box); table.insert(parts, coin)
-      anchor, gap = coin, 6
-    end
-    return { parts = parts, refresh = refresh, read = read, boxes = boxes }
-  end
-  win.budgetBox = MoneyBoxes("Budget:", 16,
-    function() return cfg.budgetCopper end,
-    function(v) cfg.budgetCopper = (v and v > 0) and v or nil end)
-  win.keepBox = MoneyBoxes("Keep back:", 372,
-    function() return (cfg.reserveCopper or 0) > 0 and cfg.reserveCopper or nil end,
-    function(v) cfg.reserveCopper = v or 0 end)
-  local hint = win:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-  hint:SetPoint("BOTTOMLEFT", 238, 52)
-  hint:SetText("empty = all you carry")
-  table.insert(win.budgetBox.parts, hint)
-
-  local msg = MakeTextView(win, function(_, link, text, button)
-    if IsAltKeyDown() then
-      local name = GetItemInfo(link)
-      if name then SearchInAuctionator({ name }) end
-    elseif IsShiftKeyDown() or IsControlKeyDown() then
-      SetItemRef(link, text, button) -- shift-click to link it in chat, ctrl-click to preview
-    else
-      local it = CU.lineItems and CU.lineItems[link]
-      if it then CU:ShowBreakdown(it) end
-    end
-  end)
-  msg:SetPoint("TOPLEFT", 14, -124)
-  msg:SetPoint("BOTTOMRIGHT", win, "BOTTOMLEFT", 600, 40)
-  win.msg = msg
-
-  -- Breakdown column: how the clicked item was scored.
-  local divider = win:CreateTexture(nil, "ARTWORK")
-  divider:SetColorTexture(1, 1, 1, 0.12)
-  divider:SetPoint("TOPLEFT", win, "TOPLEFT", 636, -32)
-  divider:SetPoint("BOTTOMLEFT", win, "BOTTOMLEFT", 636, 40)
-  divider:SetWidth(1)
-  local bd = MakeTextView(win)
-  bd:SetPoint("TOPLEFT", win, "TOPLEFT", 648, -34)
-  bd:SetPoint("BOTTOMRIGHT", -38, 40)
-  win.breakdown = bd
-  CU.ShowBreakdownHelp()
-
-  local all = CreateFrame("Button", nil, win, "UIPanelButtonTemplate")
-  all:SetSize(220, 22)
-  all:SetPoint("BOTTOMRIGHT", -14, 10)
-  all:SetText("Search all in Auctionator")
-  all:SetScript("OnClick", function()
-    local names, seen = {}, {}
-    for _, link in ipairs(CU.shownLinks or {}) do
-      local name = GetItemInfo(link)
-      if name and not seen[name] then seen[name] = true; table.insert(names, name) end
-    end
-    if #names > 0 then SearchInAuctionator(names) end
-  end)
-  return win
+  return out
 end
+
 
 function CU:Budget()
   local have = GetMoney()
@@ -1383,7 +1625,9 @@ function CU:RenderPlan(m)
   if not weights then m:AddMessage(problem) return end
   local budget, have = self:Budget()
   local base = GearScore(weights)
+  if not base then m:AddMessage("Waiting for equipped item details before planning.") return end
   local groups = self:BuildPlanOptions(weights)
+  m:AddMessage("|cff999999Approximate plan: hit caps are shared across slots; totals below use the combined swap. Switching a two-hander to a new main hand plus off hand is not planned.|r")
 
   local source = cfg.budgetCopper and ("a set budget of " .. Money(cfg.budgetCopper)) or ("your " .. Money(have))
   local keep = (cfg.reserveCopper or 0) > 0 and (", keeping " .. Money(cfg.reserveCopper) .. " back") or ""
@@ -1394,11 +1638,46 @@ function CU:RenderPlan(m)
     m:AddMessage(" ")
     m:AddMessage(("|cffffd100%s|r  |cff999999(budget %s)|r"):format(title, Money(b)))
     local chosen, gain, spent = Knapsack(groups, b)
+    local hit=CU.HitInfo()
+    local function combined(options, omit)
+      local ns,nh,os,oh,cost=0,0,0,0,0
+      for i,o in ipairs(options) do if i~=omit then
+        ns=ns+o.newScore; nh=nh+o.newHit; os=os+o.oldScore; oh=oh+o.oldHit; cost=cost+o.cost
+      end end
+      return HitAwareGain(ns,nh,os,oh,weights,hit),cost
+    end
+    -- Independent knapsack values share hit-cap room. Drop any option whose removal
+    -- improves the actual combined swap, rather than recommending a net downgrade.
+    while #chosen>0 do
+      gain=combined(chosen)
+      local remove,best=nil,gain
+      for i=1,#chosen do
+        local without=combined(chosen,i)
+        if without>=best then remove,best=i,without end
+      end
+      if not remove then break end
+      table.remove(chosen,remove)
+    end
+    -- Pick a safe purchase order using the true marginal gain at each step.
+    local ordered={}
+    while #chosen>0 do
+      local before=combined(ordered)
+      local bestIndex,bestValue,bestGain=nil,0,0
+      for i,o in ipairs(chosen) do
+        ordered[#ordered+1]=o
+        local marginal=combined(ordered)-before
+        ordered[#ordered]=nil
+        local value=marginal/math.max(o.cost,1)
+        if value>bestValue then bestIndex,bestValue,bestGain=i,value,marginal end
+      end
+      if not bestIndex then break end
+      local o=table.remove(chosen,bestIndex); o.purchaseGain=bestGain; ordered[#ordered+1]=o
+    end
+    chosen=ordered; gain,spent=combined(chosen)
     if #chosen == 0 then
       m:AddMessage("   Nothing you can afford is an upgrade.")
       return 0
     end
-    table.sort(chosen, function(x, y) return x.gain / math.max(x.cost, 1) > y.gain / math.max(y.cost, 1) end)
     local running = 0
     for i, o in ipairs(chosen) do
       running = running + o.cost
@@ -1412,7 +1691,7 @@ function CU:RenderPlan(m)
         local data = it.link:match("|H(.-)|h")
         if data then self.lineItems[data] = it end
       end
-      local pct = base > 0 and ("+%.1f%% overall"):format(o.gain / base * 100) or "upgrade"
+      local pct = base > 0 and ("%+.1f%% overall"):format(o.purchaseGain / base * 100) or "upgrade"
       m:AddMessage(("   %d. |cffffffff%s|r  %s   %s   |cff00ff00%s|r   |cff999999total so far %s|r"):format(
         i, o.slot, Money(o.cost), table.concat(links, " + "), pct, Money(running)))
     end
@@ -1421,110 +1700,218 @@ function CU:RenderPlan(m)
     return spent
   end
 
-  local spent = show("Best plan for your budget", budget, true)
+  local spent = show("Suggested plan for your budget", budget, true)
   -- A cheaper alternative, only worth showing if the full plan uses a fair chunk of the budget.
   if spent > 0 and budget >= 20000 then show("If you'd rather spend about half", math.floor(budget / 2), false) end
 end
 
+
+
+-- Compact slot-first results window.  These definitions deliberately replace the
+-- original table view above; its scoring/search helpers are retained unchanged.
+local function NewBackdrop(f, r, g, b, a)
+  if f.SetBackdrop then pcall(f.SetBackdrop, f, { bgFile="Interface\\Tooltips\\UI-Tooltip-Background", edgeFile="Interface\\Tooltips\\UI-Tooltip-Border", edgeSize=1 }) end
+  if f.SetBackdropColor then f:SetBackdropColor(r or 0, g or 0, b or 0, a or .85) end
+  if f.SetBackdropBorderColor then f:SetBackdropBorderColor(.45, .38, .18, .65) end
+end
+local function QColour(q)
+  local c = ITEM_QUALITY_COLORS and ITEM_QUALITY_COLORS[q or 1]
+  if c then return c.r, c.g, c.b, (c.hex and c.hex:gsub("^|c%x%x", "")) or QUALITY_HEX[q or 1] end
+  local h = QUALITY_HEX[q or 1] or "ffffff"
+  return tonumber(h:sub(1,2),16)/255, tonumber(h:sub(3,4),16)/255, tonumber(h:sub(5,6),16)/255, h
+end
+local function CurrentLadder(g)
+  local items
+  if cfg.topFive and CU.lastFiltered and CU.lastFiltered[g] then
+    items = DistinctByStats(CU.lastFiltered[g]); while #items > 5 do table.remove(items) end
+  elseif cfg.showAll and CU.lastFiltered and CU.lastFiltered[g] then
+    items = DistinctByStats(CU.lastFiltered[g]); table.sort(items, function(a,b) return a.price < b.price end)
+  else items = (CU.lastLadders or {})[g] or {} end
+  return items or {}
+end
+local function DeltaText(it, cache)
+  if it.empty then return "|cffbbbbbbnew slot|r" end
+  local new = cache[it.link] or GetItemStats(it.link) or {}; cache[it.link] = new
+  local old, useful = {}, false
+  for _, link in ipairs(ReplacedLinks(it, lastWeights or {})) do
+    local s = cache[link] or GetItemStats(link) or {}; cache[link] = s
+    for k,v in pairs(s) do old[k] = (old[k] or 0) + (tonumber(v) or 0) end
+  end
+  local out, seen = {}, {}
+  for _, pair in ipairs(STAT_NAMES) do
+    local key, name = pair[1], pair[2]
+    if not seen[name] and (lastWeights and (lastWeights[key] or 0) > 0) then
+      seen[name], useful = true, true
+      local d = (new[key] or 0) - (old[key] or 0)
+      if d ~= 0 then table.insert(out, (d > 0 and "|cff00ff00+" or "|cffff6060-") .. math.abs(d) .. " " .. name .. "|r") end
+    end
+  end
+  if #out == 0 and not useful then table.insert(out, "|cffbbbbbbnew slot|r") end
+  if it.reqLevel and it.reqLevel > UnitLevel("player") then table.insert(out, "|cffff8800lvl " .. it.reqLevel .. "|r") end
+  if (it.price or 0) > GetMoney() then table.insert(out, "|cffff6060can't afford|r") end
+  return table.concat(out, "  ")
+end
+
+function GetWindow()
+  if win and win.slotRows then return win end
+  win = CreateFrame("Frame", "ChupgradesFrame", UIParent, "BasicFrameTemplateWithInset")
+  CU.window = win
+  win:SetSize(900, 520); win:SetPoint("CENTER")
+  win:SetClampedToScreen(true)
+  local function position(reset)
+    local scale = math.min(1, (UIParent:GetWidth()-24)/900, (UIParent:GetHeight()-24)/520)
+    win:SetScale(math.max(.25, scale)); win:ClearAllPoints()
+    local p = not reset and cfg.windowPosition
+    if type(p)=="table" and Finite(p.x) and Finite(p.y) and math.abs(p.x)<10000 and math.abs(p.y)<10000 then
+      win:SetPoint("CENTER", UIParent, "CENTER", p.x, p.y)
+    else win:SetPoint("CENTER", UIParent, "CENTER", 0, 0) end
+  end
+  position()
+  win:SetMovable(true); win:EnableMouse(true); win:RegisterForDrag("LeftButton"); win:SetScript("OnDragStart", win.StartMoving); win:SetScript("OnDragStop", win.StopMovingOrSizing); win:SetFrameStrata("HIGH")
+  win:SetScript("OnDragStop", function(self)
+    self:StopMovingOrSizing()
+    local x,y=self:GetCenter(); local px,py=UIParent:GetCenter(); local scale=self:GetScale()
+    if x and y and px and py then cfg.windowPosition={x=x*scale-px,y=y*scale-py} end
+  end)
+  CU.ResetPosition = function() cfg.windowPosition=nil; position(true) end
+  if win.TitleText then win.TitleText:SetText("Chupgrades") end
+  tinsert(UISpecialFrames, "ChupgradesFrame")
+  win.header = win:CreateFontString(nil,"OVERLAY","GameFontDisableSmall"); win.header:SetPoint("TOPLEFT",14,-30)
+  win.header:SetWidth(490); win.header:SetHeight(16); win.header:SetJustifyH("LEFT")
+  win.tabs = {}
+  local function tab(text, n, click)
+    local b=CreateFrame("Button",nil,win,"UIPanelButtonTemplate"); b:SetSize(n==1 and 108 or 82,20); b:SetPoint("TOPRIGHT", win,"TOPRIGHT", -92-(3-n)*86-(n==1 and 20 or 0), -27); b:SetText(text); b:SetScript("OnClick",click); win.tabs[n]=b
+  end
+  tab("Biggest upgrades",1,function() cfg.view="list"; cfg.topFive=true; cfg.showAll=false; CU:Render() end)
+  tab("Best value",2,function() cfg.view="list"; cfg.topFive=false; cfg.showAll=false; CU:Render() end)
+  tab("Plan",3,function() cfg.view="plan"; CU:Render() end)
+  local filters=CreateFrame("Button",nil,win,"UIPanelButtonTemplate"); filters:SetSize(64,20); filters:SetPoint("TOPRIGHT",-14,-27); filters:SetText("Filters")
+  local panel=CreateFrame("Frame",nil,win,"BackdropTemplate"); panel:SetSize(650,132); panel:SetPoint("TOPRIGHT",-14,-51); panel:SetFrameStrata("DIALOG"); NewBackdrop(panel,.04,.04,.04,.96); panel:Hide(); win.filterPanel=panel
+  filters:SetScript("OnClick",function() panel:SetShown(not panel:IsShown()) end)
+  local ql=panel:CreateFontString(nil,"OVERLAY","GameFontNormalSmall"); ql:SetPoint("TOPLEFT",10,-10); ql:SetText("Quality")
+  win.qualityChecks={}; local x=10
+  for q=0,4 do local cb=CreateFrame("CheckButton",nil,panel,"UICheckButtonTemplate"); cb:SetSize(20,20); cb:SetPoint("TOPLEFT",x,-28); local l=panel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall"); l:SetPoint("LEFT",cb,"RIGHT",0,0); l:SetText(QUALITY_NAMES[q]); local r,g,b=QColour(q); l:SetTextColor(r,g,b); cb:SetScript("OnClick",function(self) cfg.hiddenQuality[q]=(not self:GetChecked()) or nil; CU:Render() end); win.qualityChecks[q]=cb; x=x+105 end
+  local set=CreateFrame("Button",nil,panel,"UIPanelButtonTemplate"); set:SetSize(122,20); set:SetPoint("TOPLEFT",10,-54); set:SetScript("OnClick",function() cfg.setFilter=({any="only",only="none",none="any"})[cfg.setFilter] or "only"; CU:Render() end); win.setButton=set
+  local dw=CreateFrame("CheckButton",nil,panel,"UICheckButtonTemplate"); dw:SetSize(20,20); dw:SetPoint("TOPLEFT",142,-54); local dl=panel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall"); dl:SetPoint("LEFT",dw,"RIGHT",0,0); dl:SetText("Dual wield"); dw:SetScript("OnClick",function(self) cfg.dualWield=self:GetChecked() and true or false; CU:BuildResults() end); win.dualWieldCheck=dw
+  local every=CreateFrame("CheckButton",nil,panel,"UICheckButtonTemplate"); every:SetSize(20,20); every:SetPoint("TOPLEFT",255,-54); local el=panel:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall"); el:SetPoint("LEFT",every,"RIGHT",0,0); el:SetText("Show every upgrade"); every:SetScript("OnClick",function(self) cfg.showAll=self:GetChecked() and true or false; if cfg.showAll then cfg.topFive=false; cfg.view="list" end; CU:Render() end); win.showAllCheck=every
+  local all=CreateFrame("Button",nil,panel,"UIPanelButtonTemplate"); all:SetSize(38,18); all:SetPoint("TOPLEFT",440,-55); all:SetText("All"); all:SetScript("OnClick",function() wipe(cfg.hiddenSlots); CU:Render() end)
+  local none=CreateFrame("Button",nil,panel,"UIPanelButtonTemplate"); none:SetSize(42,18); none:SetPoint("LEFT",all,"RIGHT",3,0); none:SetText("None"); none:SetScript("OnClick",function() for _,g in ipairs(GROUP_ORDER) do cfg.hiddenSlots[g]=true end; CU:Render() end)
+  local sl=panel:CreateFontString(nil,"OVERLAY","GameFontNormalSmall"); sl:SetPoint("TOPLEFT",10,-84); sl:SetText("Spec")
+  CU.MakeSpecRow(panel,"TOPLEFT",panel,"TOPLEFT",48,-80)
+  local div=win:CreateTexture(nil,"ARTWORK"); div:SetColorTexture(1,1,1,.12); div:SetPoint("TOPLEFT",230,-51); div:SetPoint("BOTTOMLEFT",230,34); div:SetWidth(1)
+  win.slotRows={}
+  for i,g in ipairs(GROUP_ORDER) do
+    local row=CreateFrame("Button",nil,win,"BackdropTemplate"); row:SetSize(210,25); row:SetPoint("TOPLEFT",12,-52-(i-1)*26); row:EnableMouse(true); NewBackdrop(row,0,0,0,0); row.cb=CreateFrame("CheckButton",nil,row,"UICheckButtonTemplate"); row.cb:SetSize(18,18); row.cb:SetPoint("LEFT",0,0); row.name=row:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall"); row.name:SetPoint("LEFT",row.cb,"RIGHT",0,0); row.status=row:CreateFontString(nil,"OVERLAY","GameFontDisableSmall"); row.status:SetPoint("RIGHT",-3,0); row.group=g
+    row.cb:SetScript("OnClick",function(self) cfg.hiddenSlots[g]=(not self:GetChecked()) or nil; CU:Render() end)
+    row:SetScript("OnClick",function(self) if self.cb:IsMouseOver() then return end; CU.selectedSlot=g; cfg.selectedSlot=g; CU:Render() end); win.slotRows[g]=row
+  end
+  local search=CreateFrame("Button",nil,win,"UIPanelButtonTemplate"); search:SetSize(210,22); search:SetPoint("BOTTOMLEFT",12,31); search:SetText("Search ticked slots"); search:SetScript("OnClick",function() CU:StartSlotSearch() end); win.slotSearchButton=search; CU.slotSearchButton=search
+  local bar=CreateFrame("StatusBar",nil,win); bar:SetSize(210,12); bar:SetPoint("BOTTOMLEFT",12,17); bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar"); bar:SetStatusBarColor(.2,.8,.25); bar.label=bar:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall"); bar.label:SetPoint("CENTER"); bar:Hide(); win.progressBar=bar
+  win.wearing=win:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall"); win.wearing:SetPoint("TOPLEFT",244,-57); win.wearing:SetWidth(638); win.wearing:SetJustifyH("LEFT")
+  win.cards={}; for i=1,6 do
+    local c=CreateFrame("Button",nil,win,"BackdropTemplate"); c:SetSize(638,46); c:SetPoint("TOPLEFT",244,-76-(i-1)*49); c:EnableMouse(true); NewBackdrop(c,.03,.03,.03,.88); c.icon=c:CreateTexture(nil,"ARTWORK"); c.icon:SetSize(32,32); c.icon:SetPoint("LEFT",6,0); c.name=c:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall"); c.name:SetPoint("TOPLEFT",c.icon,"TOPRIGHT",7,-4); c.name:SetWidth(400); c.delta=c:CreateFontString(nil,"OVERLAY","GameFontDisableSmall"); c.delta:SetPoint("TOPLEFT",c.name,"BOTTOMLEFT",0,-3); c.delta:SetWidth(430); c.pct=c:CreateFontString(nil,"OVERLAY","GameFontNormal"); c.pct:SetPoint("TOPRIGHT",-77,-5); c.price=c:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall"); c.price:SetPoint("TOPRIGHT",-77,-24); c.find=CreateFrame("Button",nil,c,"UIPanelButtonTemplate"); c.find:SetSize(42,18); c.find:SetPoint("RIGHT",-5,0); c.find:SetText("Find"); c.find:SetScript("OnClick",function(self) local n=GetItemInfo(self:GetParent().item.link); if n then SearchInAuctionator({n}) end end); c:SetScript("OnEnter",function(self) if self.item then GameTooltip:SetOwner(self,"ANCHOR_CURSOR"); GameTooltip:SetHyperlink(self.item.link); GameTooltip:AddLine("Alt-click Find • Shift-click links",.6,.6,.6); GameTooltip:Show() end end); c:SetScript("OnLeave",function() GameTooltip:Hide() end); c:SetScript("OnClick",function(self,button) if not self.item then return end; if IsAltKeyDown() then local n=GetItemInfo(self.item.link); if n then SearchInAuctionator({n}) end elseif IsShiftKeyDown() then SetItemRef(self.item.link,self.item.link,button) else CU:ShowBreakdown(self.item); win.breakdown.frame:Show(); win.breakdownClose:Show(); end end); c:Hide(); win.cards[i]=c
+  end
+  win.empty=win:CreateFontString(nil,"OVERLAY","GameFontDisableSmall"); win.empty:SetPoint("TOPLEFT",244,-86); win.empty:SetWidth(580); win.empty:SetJustifyH("LEFT")
+  local es=CreateFrame("Button",nil,win,"UIPanelButtonTemplate"); es:SetSize(120,22); es:SetPoint("TOPLEFT",244,-114); es:SetScript("OnClick",function() if CU.selectedSlot then CU:StartSlotSearch({CU.selectedSlot}) end end); win.emptySearch=es; es:Hide()
+  local bd=MakeTextView(win); bd:SetPoint("TOPLEFT",244,-372); bd:SetPoint("BOTTOMRIGHT",-16,35); win.breakdown=bd; bd:Hide()
+  local close=CreateFrame("Button",nil,win,"UIPanelCloseButton"); close:SetSize(20,20); close:SetPoint("TOPRIGHT",bd.frame,"TOPRIGHT",2,2); close:SetScript("OnClick",function() bd.frame:Hide(); close:Hide() end); win.breakdownClose=close; close:Hide()
+  local msg=MakeTextView(win, function(_, link, _, button)
+    local it=CU.lineItems and CU.lineItems[link]
+    if not it then return end
+    if IsAltKeyDown() then local name=GetItemInfo(it.link); if name then SearchInAuctionator({name}) end
+    elseif IsShiftKeyDown() then SetItemRef(link,it.link,button)
+    elseif IsControlKeyDown and IsControlKeyDown() and DressUpItemLink then DressUpItemLink(it.link)
+    else CU:ShowBreakdown(it); win.breakdown:Show(); win.breakdownClose:Show() end
+  end); msg:SetPoint("TOPLEFT",244,-106); msg:SetPoint("BOTTOMRIGHT",-16,66); win.msg=msg; msg.frame:Hide()
+  local breakdownLevel=(msg.frame:GetFrameLevel() or 1)+5
+  bd.frame:SetFrameLevel(breakdownLevel)
+  local bdBackground=CreateFrame("Frame",nil,bd.frame,"BackdropTemplate")
+  bdBackground:SetAllPoints(bd.frame); bdBackground:SetFrameLevel(breakdownLevel)
+  NewBackdrop(bdBackground,.03,.03,.03,1)
+  close:SetFrameLevel(breakdownLevel+4)
+  local allSearch=CreateFrame("Button",nil,win,"UIPanelButtonTemplate"); allSearch:SetSize(170,20); allSearch:SetPoint("BOTTOMRIGHT",-14,12); allSearch:SetText("Search all in Auctionator"); allSearch:SetScript("OnClick",function() local names,seen={},{}; for _,l in ipairs(CU.shownLinks or {}) do local n=GetItemInfo(l); if n and not seen[n] then seen[n]=true; table.insert(names,n) end end; if #names>0 then SearchInAuctionator(names) end end)
+  local function moneyField(label, x, field)
+    local text=win:CreateFontString(nil,"OVERLAY","GameFontNormalSmall"); text:SetPoint("TOPLEFT",x,-60); text:SetText(label)
+    local box=CreateFrame("EditBox",nil,win,"InputBoxTemplate"); box:SetSize(140,20); box:SetPoint("TOPLEFT",x+68,-55); box:SetAutoFocus(false)
+    local function restore() box:SetText(field=="budgetCopper" and cfg[field]==nil and "" or MoneyInput(cfg[field] or 0)) end
+    box:SetScript("OnEscapePressed",function(self) restore(); self:ClearFocus() end)
+    box:SetScript("OnEnterPressed",function(self)
+      local input=self:GetText():match("^%s*(.-)%s*$")
+      local value,err=CU.ParseMoney(input)
+      if input=="" then value=field=="reserveCopper" and 0 or nil; err=nil end
+      if err then Print(err); restore(); return end
+      cfg[field]=value; self:ClearFocus(); CU:Render()
+    end)
+    return {label=text, box=box, restore=restore}
+  end
+  win.budgetField=moneyField("Budget",244,"budgetCopper")
+  win.reserveField=moneyField("Keep",570,"reserveCopper")
+  win.prevPage=CreateFrame("Button",nil,win,"UIPanelButtonTemplate"); win.prevPage:SetSize(64,20); win.prevPage:SetPoint("BOTTOMLEFT",244,39); win.prevPage:SetText("Previous")
+  win.nextPage=CreateFrame("Button",nil,win,"UIPanelButtonTemplate"); win.nextPage:SetSize(64,20); win.nextPage:SetPoint("BOTTOMLEFT",470,39); win.nextPage:SetText("Next")
+  win.pageLabel=win:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall"); win.pageLabel:SetPoint("BOTTOMLEFT",317,43)
+  win.prevPage:SetScript("OnClick",function() CU.page=math.max(1,(CU.page or 1)-1); CU:Render() end)
+  win.nextPage:SetScript("OnClick",function() CU.page=math.min(CU.pageCount or 1,(CU.page or 1)+1); CU:Render() end)
+  for _,cb in pairs(win.qualityChecks) do cb:SetHitRectInsets(0,-76,0,0) end
+  win.dualWieldCheck:SetHitRectInsets(0,-75,0,0); win.showAllCheck:SetHitRectInsets(0,-137,0,0)
+  for _,card in ipairs(win.cards) do
+    card:SetScript("OnClick",function(self,button)
+      local it=self.item; if not it then return end
+      if IsAltKeyDown() then local name=GetItemInfo(it.link); if name then SearchInAuctionator({name}) end
+      elseif IsShiftKeyDown() then SetItemRef(it.link,it.link,button)
+      elseif IsControlKeyDown and IsControlKeyDown() and DressUpItemLink then DressUpItemLink(it.link)
+      else CU:ShowBreakdown(it); win.breakdown:Show(); win.breakdownClose:Show() end
+    end)
+  end
+  return win
+end
+
 function CU:Render()
-  -- Some items had no details last time: score everything again (cheap; scores are cached).
-  if (self.pendingLoading or 0) > 0 and not self.inBuild and self.lastScan then
-    self.retries = 99 -- no extra retry loop, just one fresh pass
-    return self:BuildResults()
+  if (self.pendingLoading or 0)>0 and not self.inBuild and self.lastScan then self.retries=99; return self:BuildResults() end
+  self:BuildViews(); local w=GetWindow(); local mode=CU.ModeLine():gsub("|c%x%x%x%x%x%x%x%x",""):gsub("|r",""):gsub("Scoring: ","")
+  w.header:SetText(mode .. " · level " .. (UnitLevel("player") or 0) .. " · " .. Money(GetMoney()))
+  local selected=cfg.view=="plan" and 3 or (cfg.topFive and 1 or 2); for i,b in ipairs(w.tabs) do b:SetAlpha(i==selected and 1 or .55); b:SetEnabled(i~=selected) end
+  for q,cb in pairs(w.qualityChecks) do cb:SetChecked(not cfg.hiddenQuality[q]) end; w.dualWieldCheck:SetChecked(cfg.dualWield); w.showAllCheck:SetChecked(cfg.showAll); w.setButton:SetText(({any="Set pieces: any",only="Set pieces: only",none="Set pieces: none"})[cfg.setFilter] or "Set pieces: any"); CU.RefreshSpecBoxes()
+  local best,bestPct=nil,-math.huge; local ladders={}; for _,g in ipairs(GROUP_ORDER) do ladders[g]=CurrentLadder(g); local it=ladders[g][1]; if it then local _,p=UpgradeMetrics(it,lastWeights); if p>bestPct then best,bestPct=g,p end end end
+  if not self.selectedSlot or not ladders[self.selectedSlot] then self.selectedSlot=cfg.selectedSlot or best or GROUP_ORDER[1] end
+  for _,g in ipairs(GROUP_ORDER) do local r=w.slotRows[g]; r.cb:SetChecked(not cfg.hiddenSlots[g]); r.name:SetText(g); local it=CU.lastFiltered and CU.lastFiltered[g] and DistinctByStats(CU.lastFiltered[g])[1]; if it then local _,p=UpgradeMetrics(it,lastWeights); r.status:SetText("|cff00ff00+"..string.format("%.1f",p).."%|r") elseif (self.searchedGroups or {})[g] then r.status:SetText("none found") else r.status:SetText("not searched") end; if g==self.selectedSlot then NewBackdrop(r,.22,.17,.05,.8) else NewBackdrop(r,0,0,0,0) end end
+  for _,c in ipairs(w.cards) do c:Hide() end; w.empty:Hide(); w.emptySearch:Hide(); w.breakdown.frame:Hide(); w.breakdownClose:Hide(); w.msg.frame:Hide(); self.shownLinks={}; self.lineItems={}
+  for _,field in ipairs({w.budgetField,w.reserveField}) do
+    field.label:SetShown(cfg.view=="plan"); field.box:SetShown(cfg.view=="plan")
+    if not field.box:HasFocus() then field.restore() end
   end
-  self:BuildViews()
-  local groups = self.lastLadders or {}
-  local w = GetWindow()
-  local m = w.msg
-  m:Clear()
-  self.shownLinks, self.lineItems = {}, {}
-  local money, level, any = GetMoney(), UnitLevel("player"), false
-
-  -- Keep the controls in step with the settings.
-  local shownSlots = 0
-  for g, cb in pairs(w.filterButtons) do
-    local on = not cfg.hiddenSlots[g]
-    cb:SetChecked(on)
-    w.filterLabels[g]:SetTextColor(on and 1 or 0.5, on and 0.82 or 0.5, on and 0 or 0.5) -- gold when on, grey when off
-    if on then shownSlots = shownSlots + 1 end
-  end
-  w.dualWieldCheck:SetChecked(cfg.dualWield)
-  w.viewButton:SetText(cfg.view == "plan" and "Show list by slot" or "Plan my purchases")
-
-  -- Budget boxes only belong to the plan view; the list gets their row back otherwise.
-  local planning = cfg.view == "plan"
-  for _, mb in ipairs({ w.budgetBox, w.keepBox }) do
-    for _, part in ipairs(mb.parts) do part:SetShown(planning) end
-    if planning then mb.refresh() end
-  end
-  for _, part in ipairs(w.showAllParts) do part:SetShown(not planning) end
-  w.showAllCheck:SetChecked(cfg.showAll)
-  m:SetPoint("BOTTOMRIGHT", w, "BOTTOMLEFT", 600, 72)
-
-  m:AddMessage(CU.ModeLine())
-  if shownSlots < #GROUP_ORDER then
-    m:AddMessage(("|cffff8800Showing %d of %d slots - tick more slots above, or click All.|r"):format(shownSlots, #GROUP_ORDER))
-  end
-  if (self.hiddenByFilters or 0) > 0 then
-    m:AddMessage(("|cffff8800Quality / set filters are hiding %d upgrade%s.|r"):format(self.hiddenByFilters,
-      self.hiddenByFilters == 1 and "" or "s"))
-  end
-  for q, cb in pairs(w.qualityChecks) do cb:SetChecked(not cfg.hiddenQuality[q]) end
-  CU.RefreshSpecBoxes()
-  w.setButton:SetText(({ any = "Set pieces: any", only = "Only set pieces", none = "No set pieces" })[cfg.setFilter] or "Set pieces: any")
-  if planning then
-    self:RenderPlan(m)
-    m:Done()
-    w:Show()
-    return
-  end
-
-  local gearBase = lastWeights and GearScore(lastWeights) or 0
-  m:AddMessage(cfg.showAll
-    and "|cff999999Every upgrade, cheapest first (up to 30 per slot). Alt-click an item to search it in Auctionator. Shift-click a slot to show only that slot.|r"
-    or "|cff999999Best value only: cheapest first, each line a bigger upgrade than the one above it. Tick \"Show every upgrade\" to see them all. Alt-click an item to search it in Auctionator.|r")
-  for _, g in ipairs(GROUP_ORDER) do
-    local ladder
-    if not cfg.hiddenSlots[g] then
-      if cfg.showAll and self.lastFiltered and self.lastFiltered[g] then
-        ladder = {}
-        for i, it in ipairs(self.lastFiltered[g]) do ladder[i] = it end
-        table.sort(ladder, function(a, b) return a.price < b.price end)
-        while #ladder > 30 do table.remove(ladder) end
-      elseif groups[g] then
-        ladder = Trim(groups[g])
-      end
-    end
-    if ladder and #ladder > 0 then
-      any = true
-      m:AddMessage(" ")
-      m:AddMessage("|cffffd100" .. g .. "|r  |cff999999wearing: " .. WearingText(g) .. "|r")
-      for _, it in ipairs(ladder) do
-        local sum = StatSummary(it.link)
-        -- Shown as a share of your whole gear score, so slots can be compared with each other.
-        -- (A percentage of the slot alone balloons when your current item there is weak.)
-        local overall = gearBase > 0 and (it.gain / gearBase * 100) or 0
-        local gain = ("|cff00ff00+%.1f%% overall|r  |cff999999(%.2f%% per gold)%s|r"):format(
-          overall, overall / math.max(it.price / 10000, 1),
-          it.empty and (it.slotHasItem and ", replaces an item with no useful stats" or ", empty slot") or "")
-        local lvl    = (it.reqLevel and it.reqLevel > level) and ("  |cffff8800usable at %d|r"):format(it.reqLevel) or ""
-        local afford = (it.price > money) and "  |cffff4444can't afford|r" or ""
-        local hitNote = it.hitWasted and "  |cff999999(hit past your cap not counted)|r" or ""
-        local setName = SetName(it.setID)
-        if setName then hitNote = hitNote .. "  |cff00ccff[Set: " .. setName .. "]|r" end
-        m:AddMessage(("   %s   %s %s  %s%s%s%s"):format(Money(it.price), it.link,
-          sum ~= "" and ("|cffbbbbbb(" .. sum .. ")|r") or "", gain, lvl, afford, hitNote))
-        table.insert(self.shownLinks, it.link)
-        local data = it.link:match("|H(.-)|h")
-        if data then self.lineItems[data] = it end
+  w.prevPage:Hide(); w.nextPage:Hide(); w.pageLabel:Hide()
+  if cfg.view=="plan" then w.wearing:Hide(); w.msg:Clear(); self:RenderPlan(w.msg); w.msg:Done(); w.msg.frame:Show(); w:Show(); return end
+  local g=self.selectedSlot; local items=ladders[g] or {}; w.wearing:SetText("|cffffd100Wearing|r "..WearingText(g)); local cache={}
+  w.wearing:Show()
+  local signature=g..":"..cfg.view..":"..tostring(cfg.topFive)..":"..tostring(cfg.showAll)..":"..cfg.setFilter
+  for q=0,4 do signature=signature..tostring(cfg.hiddenQuality[q]) end
+  if signature~=self.pageSignature then self.page=1; self.pageSignature=signature end
+  self.pageCount=math.max(1,math.ceil(#items/6)); self.page=math.max(1,math.min(self.page or 1,self.pageCount))
+  w.prevPage:SetEnabled(self.page>1); w.nextPage:SetEnabled(self.page<self.pageCount)
+  w.pageLabel:SetText(("Page %d/%d · %d upgrades%s"):format(self.page,self.pageCount,#items,self.partialScan and " · partial scan" or ""))
+  w.prevPage:Show(); w.nextPage:Show(); w.pageLabel:Show()
+  if #items==0 then
+    local hidden=#((self.lastAll or {})[g] or {})>0
+    local text=hidden and ("Upgrades for "..g.." are hidden by your filters.")
+      or (self.searchedGroups or {})[g] and ("No upgrades found for "..g..". Search again to check current listings.")
+      or (g.." hasn't been searched yet.")
+    if self.partialScan then text=text.." The last search was partial; retained prices may be stale." end
+    if (self.pendingLoading or 0)>0 then text=text.." Waiting for item details." end
+    w.empty:SetText(text); w.empty:Show(); w.emptySearch:SetText("Search "..g); w.emptySearch:Show()
+  else
+    local first=(self.page-1)*6
+    for card=1,6 do
+      local it=items[first+card]
+      if it then
+        local c=w.cards[card]; local n,_,q,_,_,_,_,_,_,icon=GetItemInfo(it.link); local _,_,_,hex=QColour(q or it.quality)
+        c.item=it; c.icon:SetTexture(icon or "Interface\\Icons\\INV_Misc_QuestionMark")
+        c.name:SetText("|cff"..hex..(n or it.link).."|r"); c.delta:SetText(DeltaText(it,cache))
+        local _,p=UpgradeMetrics(it,lastWeights); c.pct:SetText("|cff00ff00+"..string.format("%.1f",p).."%|r")
+        c.price:SetText(Money(it.price or 0)); c:Show(); table.insert(self.shownLinks,it.link)
+        local key=it.link:match("|H(.-)|h"); if key then self.lineItems[key]=it end
       end
     end
   end
-  if not any then
-    m:AddMessage(" ")
-    m:AddMessage("No upgrades found in the slots you've selected. Try more slots, |cffffffff/cu min 0|r or |cffffffff/cu ahead 2|r.")
-  end
-  m:Done()
   w:Show()
 end
 
@@ -1589,9 +1976,22 @@ local function BuildAHTab()
   scan:SetText("Scan for upgrades")
   scan:SetScript("OnClick", function() CU:StartScan() end)
 
+  local slotSearch = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+  slotSearch:SetSize(220, 26)
+  slotSearch:SetPoint("TOP", scan, "BOTTOM", 0, -8)
+  slotSearch:SetText("Search slots")
+  slotSearch:SetScript("OnClick", function() CU:StartSlotSearch() end)
+  CU.ahSlotSearchButton = slotSearch
+  local ahBar = CreateFrame("StatusBar", nil, panel)
+  ahBar:SetSize(300, 18)
+  ahBar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar"); ahBar:SetStatusBarColor(0.2, 0.8, 0.25)
+  local ahBg = ahBar:CreateTexture(nil, "BACKGROUND"); ahBg:SetAllPoints(); ahBg:SetColorTexture(0, 0, 0, 0.5)
+  ahBar.label = ahBar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall"); ahBar.label:SetPoint("CENTER")
+  ahBar:Hide(); CU.ahProgressBar = ahBar
+
   local list = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
   list:SetSize(220, 26)
-  list:SetPoint("TOP", scan, "BOTTOM", 0, -12)
+  list:SetPoint("TOP", slotSearch, "BOTTOM", 0, -8)
   list:SetText("Show upgrades by slot")
   list:SetScript("OnClick", function()
     if not CU.lastScan then Print("No scan yet: click Scan for upgrades first.") return end
@@ -1608,7 +2008,9 @@ local function BuildAHTab()
   end)
 
   local status = panel:CreateFontString(nil, "OVERLAY", "GameFontDisable")
-  status:SetPoint("TOP", plan, "BOTTOM", 0, -20)
+  -- The progress bar sits between the buttons and the status lines, in its own gap.
+  CU.ahProgressBar:SetPoint("TOP", plan, "BOTTOM", 0, -14)
+  status:SetPoint("TOP", plan, "BOTTOM", 0, -44)
   local cooldown = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   cooldown:SetPoint("TOP", status, "BOTTOM", 0, -8)
   local note = panel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
@@ -1618,7 +2020,7 @@ local function BuildAHTab()
   CU.updateTabStatus = function()
     if not CU.detectedSpecName then GetWeights() end
     CU.RefreshSpecBoxes()
-    status:SetText(AgoText())
+    status:SetText(CU.slotSearchProgress or AgoText())
     cooldown:SetText(CooldownText())
     local left = CU.ScanCooldownLeft()
     if left > 0 then
@@ -1627,6 +2029,12 @@ local function BuildAHTab()
     else
       scan:Enable()
       scan:SetText("Scan for upgrades")
+    end
+    if CU.slotSearch then
+      slotSearch:Disable()
+    else
+      slotSearch:Enable()
+      slotSearch:SetText("Search slots")
     end
   end
   panel:SetScript("OnShow", CU.updateTabStatus)
@@ -1660,7 +2068,7 @@ end
 
 local refreshTimer
 local function RefreshSoon()
-  if not (CU.lastScan and win and win:IsShown()) then return end
+  if CU.slotSearch or not (CU.lastScan and win and win:IsShown()) then return end
   if refreshTimer then refreshTimer:Cancel() end
   refreshTimer = C_Timer.NewTimer(1, function() CU.retries = 0; CU:BuildResults() end)
 end
@@ -1678,9 +2086,41 @@ Listen("PLAYER_LEVEL_UP")
 Listen("SKILL_LINES_CHANGED")                   -- trained a new weapon skill
 Listen("PLAYER_MONEY")                          -- gold changed: the plan's budget changed
 Listen("GET_ITEM_INFO_RECEIVED")                -- item details arrived: re-check items that were waiting
+Listen("ITEM_DATA_LOAD_RESULT")
+local function NormalizeSettings(data)
+  data=type(data)=="table" and data or {}
+  for k,v in pairs(CU.Defaults) do
+    if type(v)=="boolean" and type(data[k])~="boolean" or data[k]==nil then data[k]=v end
+  end
+  local limits={minUpgradePct={0,1000000,false,2},levelLookahead={0,60,true,0},maxPerSlot={1,100,true,8},
+    searchCap={1,2000,true,200},searchFloor={0,100,true,10},reserveCopper={0,MAX_MONEY,true,0}}
+  for k,r in pairs(limits) do if not ValidNumber(data[k],r[1],r[2],r[3]) then data[k]=r[4] end end
+  if data.budgetGold~=nil and ValidNumber(tonumber(data.budgetGold),0,MAX_MONEY/10000) then data.budgetCopper=math.floor(tonumber(data.budgetGold)*10000+.5) end
+  if data.reserveGold~=nil and ValidNumber(tonumber(data.reserveGold),0,MAX_MONEY/10000) then data.reserveCopper=math.floor(tonumber(data.reserveGold)*10000+.5) end
+  data.budgetGold,data.reserveGold=nil,nil
+  if not ValidNumber(data.budgetCopper,0,MAX_MONEY,true) then data.budgetCopper=nil end
+  if data.view~="plan" then data.view="list" end
+  if data.levelling~="on" and data.levelling~="off" then data.levelling="auto" end
+  if data.setFilter~="only" and data.setFilter~="none" then data.setFilter="any" end
+  for _,k in ipairs({"hiddenSlots","hiddenQuality","specOverride"}) do if type(data[k])~="table" then data[k]={} end end
+  local names={}; for _,g in ipairs(GROUP_ORDER) do names[g]=true end
+  if not names[data.selectedSlot] then data.selectedSlot=nil end
+  if not ValidNumber(data.lastReplicateAt,0,time()+60) then data.lastReplicateAt=nil end
+  local saved=data.savedScan
+  if type(saved)=="table" and type(saved.items)=="table" and ValidNumber(saved.time,0,time()+60) then
+    local clean={}
+    for link,a in pairs(saved.items) do
+      if type(link)=="string" and link:match("item:%d+") and type(a)=="table" and EQUIP[a.equipLoc]
+        and ValidNumber(a.price,0,MAX_MONEY) and a.price>0 and (a.classID==2 or a.classID==4)
+        and ValidNumber(a.subID,0,30,true) then clean[link]=a end
+    end
+    saved.items=clean
+  else data.savedScan=nil end
+  return data
+end
 ev:SetScript("OnEvent", function(_, event, arg1)
   if event == "ADDON_LOADED" and arg1 == "Chupgrades" then
-    ChupgradesDB = ChupgradesDB or {}
+    ChupgradesDB = NormalizeSettings(ChupgradesDB)
     for k, v in pairs(CU.Defaults) do
       if ChupgradesDB[k] == nil then ChupgradesDB[k] = v end
     end
@@ -1688,15 +2128,14 @@ ev:SetScript("OnEvent", function(_, event, arg1)
     if type(ChupgradesDB.hiddenQuality) ~= "table" then ChupgradesDB.hiddenQuality = {} end
     if ChupgradesDB.setFilter ~= "only" and ChupgradesDB.setFilter ~= "none" then ChupgradesDB.setFilter = "any" end
     -- Older versions saved these in gold; they're in copper now.
-    if ChupgradesDB.budgetGold then ChupgradesDB.budgetCopper = math.floor(ChupgradesDB.budgetGold * 10000 + 0.5) end
-    if ChupgradesDB.reserveGold and ChupgradesDB.reserveGold > 0 then
-      ChupgradesDB.reserveCopper = math.floor(ChupgradesDB.reserveGold * 10000 + 0.5)
-    end
     ChupgradesDB.budgetGold, ChupgradesDB.reserveGold = nil, nil
     cfg = ChupgradesDB
     -- Bring back the last scan, so results survive /reload and logging out.
     if type(cfg.savedScan) == "table" and type(cfg.savedScan.items) == "table" then
       CU.lastScan, CU.lastScanTime = cfg.savedScan.items, cfg.savedScan.time
+      CU.partialScan=cfg.savedScan.partial==true
+      CU.fullScanComplete=cfg.savedScan.full==true
+      CU.searchedGroups=type(cfg.savedScan.groups)=="table" and cfg.savedScan.groups or {}
       CU.summaryShown = true
     end
   elseif event == "PLAYER_LOGIN" then
@@ -1724,10 +2163,16 @@ ev:SetScript("OnEvent", function(_, event, arg1)
     MakeAHTab()
     C_Timer.After(0.2, function() if not CU.ahTabMade then MakeAHTab() end end)
     C_Timer.After(1, function() if not CU.ahTabMade then MakeAHTab(true) end end)
-  elseif event == "GET_ITEM_INFO_RECEIVED" then
-    if (CU.pendingLoading or 0) > 0 and CU.lastScan and win and win:IsShown() then
+  elseif event == "GET_ITEM_INFO_RECEIVED" or event == "ITEM_DATA_LOAD_RESULT" then
+    wipe(scoreCache)
+    -- A slot search asks for thousands of items' details; it rebuilds once when it finishes.
+    if not CU.slotSearch and (CU.pendingLoading or 0) > 0 and CU.lastScan and win and win:IsShown() then
       if CU.itemInfoTimer then CU.itemInfoTimer:Cancel() end
-      CU.itemInfoTimer = C_Timer.NewTimer(1, function() CU.retries = 99; CU:BuildResults() end)
+      local snapshot=CU.lastScan
+      CU.itemInfoTimer = C_Timer.NewTimer(1, function()
+        CU.itemInfoTimer=nil
+        if CU.lastScan==snapshot then CU.retries = 99; CU:BuildResults() end
+      end)
     end
   elseif event == "PLAYER_MONEY" then
     if cfg.view == "plan" and CU.lastLadders and win and win:IsShown() then CU:Render() end
@@ -1805,13 +2250,14 @@ function CU.Why(text)
       Say(true, "You can use it" .. ((type(why) == "number" and why > level) and (" from level " .. why) or ""))
       -- 4. Score vs what you wear
       local new = ScoreItem(l, weights) or 0
-      local old, oldHit = EquippedScore(def, weights)
+      local old, oldHit = EquippedScore(def, weights, new, HitRating(l), CU.HitInfo())
+      if old==nil then Say(false,"Waiting for equipped item details; this comparison is deferred.") return end
       local gain = HitAwareGain(new, HitRating(l), old, oldHit, weights, CU.HitInfo())
       local pct = old > 0 and gain / old * 100 or (new > 0 and math.huge or 0)
       local gearBase = GearScore(weights)
       local capNote = math.abs(gain - (new - old)) > 0.005 and " after the hit-cap adjustment (hit past your cap doesn't count)" or ""
       Say(gain > 0, ("Scores %.2f vs %.2f for what you wear: %s points%s (%+.1f%% overall)."):format(new, old,
-        (gain >= 0 and "+" or "") .. ("%.2f"):format(gain), capNote, gearBase > 0 and gain / gearBase * 100 or 0))
+        (gain >= 0 and "+" or "") .. ("%.2f"):format(gain), capNote, gearBase and gearBase > 0 and gain / gearBase * 100 or 0))
       if gain > 0 and old > 0 then
         Say(pct >= cfg.minUpgradePct, ("Slot upgrade %.1f%%, minimum is %g%% (/cu min to change)."):format(pct, cfg.minUpgradePct))
       end
@@ -1832,6 +2278,19 @@ end
 
 SLASH_CHUPGRADES1 = "/cu"
 SLASH_CHUPGRADES2 = "/chupgrades"
+local function SlotName(want)
+  want = (want or ""):lower():match("^%s*(.-)%s*$")
+  if want=="" then return nil end
+  local match
+  for _, g in ipairs(GROUP_ORDER) do
+    if g:lower()==want then return g end
+    if g:lower():sub(1,#want)==want then
+      if match then return nil end
+      match=g
+    end
+  end
+  return match
+end
 SlashCmdList.CHUPGRADES = function(msg)
   local cmd, rest = (msg or ""):match("^(%S*)%s*(.-)$")
   cmd = cmd:lower()
@@ -1846,14 +2305,49 @@ SlashCmdList.CHUPGRADES = function(msg)
     MakeAHTab(true)
   elseif cmd == "scan" then
     CU:StartScan()
+  elseif cmd == "stop" then
+    if CU.slotSearch then CU:FinishSlotSearch("cancelled; previous results kept") end
+    if CU.fullScanRunning then EndFullScan("Full scan cancelled; previous results kept.") end
+  elseif cmd == "reset" then
+    GetWindow(); CU.ResetPosition(); Print("Window position reset.")
+  elseif cmd == "top" then
+    cfg.topFive = not cfg.topFive
+    if cfg.topFive then cfg.showAll = false end
+    Print("Top 5 biggest upgrades per slot: " .. (cfg.topFive and "on" or "off")); CU:Render()
+  elseif cmd == "searchcap" then
+    local n = tonumber(rest)
+    if not ValidNumber(n,1,2000,true) then Print("Usage: /cu searchcap <whole number 1-2000>") return end
+    cfg.searchCap = math.floor(n); Print("Slot search looks up at most " .. cfg.searchCap .. " rolled items.")
+  elseif cmd == "floor" then
+    local n = tonumber(rest)
+    if rest:lower() == "off" then cfg.searchFloor = 100
+    elseif ValidNumber(n,0,100,true) then cfg.searchFloor = n
+    else Print("Usage: /cu floor <levels below you> or /cu floor off") return end
+    Print(cfg.searchFloor >= 100 and "Slot search: every level." or ("Slot search: skips gear more than %d levels below you."):format(cfg.searchFloor))
+  elseif cmd == "search" then
+    if rest == "" then
+      CU:StartSlotSearch()
+    else
+      local groups, seen = {}, {}
+      for word in rest:gmatch("%S+") do
+        local g = SlotName(word)
+        if not g then Print("Unknown slot: " .. word .. ". Slots: " .. table.concat(GROUP_ORDER, ", ")) return end
+        if not seen[g] then seen[g] = true; table.insert(groups, g) end
+      end
+      CU:StartSlotSearch(groups)
+    end
   elseif cmd == "" or cmd == "show" then
     CU.retries = 0
     CU:BuildResults()
   elseif cmd == "min" then
-    cfg.minUpgradePct = tonumber(rest) or cfg.minUpgradePct
+    local n=tonumber(rest)
+    if not ValidNumber(n,0,1000000) then Print("Usage: /cu min <nonnegative percentage>") return end
+    cfg.minUpgradePct = n
     Print("Minimum upgrade: " .. cfg.minUpgradePct .. "%"); RefreshSoon()
   elseif cmd == "ahead" then
-    cfg.levelLookahead = tonumber(rest) or 0
+    local n=tonumber(rest)
+    if not ValidNumber(n,0,60,true) then Print("Usage: /cu ahead <whole number 0-60>") return end
+    cfg.levelLookahead = n
     Print("Showing items usable within " .. cfg.levelLookahead .. " levels."); RefreshSoon()
   elseif cmd == "armour" or cmd == "armor" then
     cfg.mainArmorOnly = not cfg.mainArmorOnly
@@ -1866,10 +2360,7 @@ SlashCmdList.CHUPGRADES = function(msg)
     if want == "all" then
       wipe(cfg.hiddenSlots); Print("Showing all slots.")
     else
-      local found
-      for _, g in ipairs(GROUP_ORDER) do
-        if g:lower() == want or g:lower():find("^" .. want) then found = g break end
-      end
+      local found = SlotName(want)
       if not found then Print("Unknown slot. Slots: " .. table.concat(GROUP_ORDER, ", ")) return end
       cfg.hiddenSlots[found] = not cfg.hiddenSlots[found] or nil
       Print(found .. ": " .. (cfg.hiddenSlots[found] and "hidden" or "shown"))
@@ -1909,10 +2400,16 @@ SlashCmdList.CHUPGRADES = function(msg)
     cfg.view = cmd
     if CU.lastScan then CU.retries = 0; CU:BuildResults() else Print("No scan yet: open the Auction House and use the Chupgrades tab.") end
   elseif cmd == "keep" then
-    cfg.reserveCopper = CU.ParseMoney(rest) or 0
+    local value,err=CU.ParseMoney(rest)
+    if rest=="" then value=0; err=nil end
+    if err then Print(err) return end
+    cfg.reserveCopper = value
     Print("Keeping " .. Money(cfg.reserveCopper) .. " back when planning."); if CU.lastLadders and win and win:IsShown() then CU:Render() end
   elseif cmd == "budget" then
-    cfg.budgetCopper = CU.ParseMoney(rest)
+    local value,err=CU.ParseMoney(rest)
+    if rest=="" then value=nil; err=nil end
+    if err then Print(err) return end
+    cfg.budgetCopper = value
     Print(cfg.budgetCopper and ("Planning with a budget of " .. Money(cfg.budgetCopper) .. ".") or "Planning with the money you're carrying.")
     if CU.lastLadders and win and win:IsShown() then CU:Render() end
   elseif cmd == "weights" then
@@ -1944,11 +2441,15 @@ SlashCmdList.CHUPGRADES = function(msg)
     local ok, why = CanUse(link, equipLoc, classID, subID)
     local def = EQUIP[equipLoc]
     print(("   Score: %.1f   Equipped: %s   Usable: %s (%s)"):format(
-      ScoreItem(link, w) or 0, def and ("%.1f"):format(EquippedScore(def, w)) or "n/a",
+      ScoreItem(link, w) or 0, def and ((EquippedScore(def, w) and ("%.1f"):format(EquippedScore(def, w))) or "loading") or "n/a",
       tostring(ok), tostring(why)))
   else
     Print("Commands:")
     print("   /cu scan  - scan the Auction House (or click the button on the AH)")
+    print("   /cu search [slot ...]  - price shown slots, or named slots such as off / head chest")
+    print("   /cu top  - toggle the top 5 biggest upgrades per slot, whatever the price")
+    print("   /cu searchcap <n>  - most rolled items a slot search looks up (now " .. (cfg.searchCap or 200) .. ")")
+    print("   /cu floor <n|off>  - slot search skips gear more than n levels below you (now " .. ((cfg.searchFloor or 10) >= 100 and "off" or (cfg.searchFloor or 10)) .. ")")
     print("   /cu  - show the last results again")
     print("   /cu min <n>  - hide upgrades smaller than n% (now " .. cfg.minUpgradePct .. ")")
     print("   /cu ahead <n>  - include items you can use within n levels (now " .. cfg.levelLookahead .. ")")

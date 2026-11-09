@@ -1,7 +1,7 @@
 ## Interface: 16001, 16000, 16002
 ## Title: Chupgrades
 ## Notes: Finds the best-value gear upgrades on the Auction House, scored with StatPriority (or StatLedger).
-## Version: 0.9.7
+## Version: 0.9.8
 ## OptionalDeps: StatLedger, StatPriority, Auctionator
 ## SavedVariables: ChupgradesDB
 
