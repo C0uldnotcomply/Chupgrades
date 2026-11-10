@@ -11,6 +11,7 @@ CU.Defaults = {
   mainArmorOnly  = true,  -- only your class's main armour type (e.g. no cloth chests for a Warrior)
   maxPerSlot     = 8,     -- max lines per slot in the best-value list
   showAll        = false, -- list view: show every upgrade instead of only the best-value ladder
+  topFive        = true,  -- default results view: biggest upgrades per slot
   levelling      = "auto",-- "auto" (on below level 60), "on" or "off"
   trackHit       = true,  -- value hit only up to your hit cap
   safeMode       = false, -- true = plain StatPriority scoring: no corrections, levelling or hit-cap logic
