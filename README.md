@@ -26,8 +26,8 @@ along with a shopping plan for your budget.
   minimum values for Intellect, MP5 and Spirit (level-60 sims barely value mana).
 * **Three result views.** Biggest upgrades shows the top five per slot. Best value is cheapest first, with
   each step a bigger upgrade. Show every upgrade includes the rest; page controls let you reach all results.
-* **Shopping plan.** Suggests a combination of upgrades within your budget and keep-back amount. Enter
-  amounts such as `1g 33s 38c` or `5` for five gold in the plan controls or slash commands.
+* **Shopping plan.** Suggests a combination of upgrades within your budget and keep-back amount. Type
+  gold, silver and copper into separate boxes, or use the slash commands with amounts like `1g 33s 38c`.
 * **Breakdown panel.** Click any item to see each stat, what it's worth to you, the hit-cap adjustment and the
   weighted % increase to your whole gear score.
 * **Filters:** slots, item quality (Poor → Epic), set pieces (any / only / none) and dual wield.

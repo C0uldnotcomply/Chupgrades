@@ -145,6 +145,18 @@ test('first results render constructs complete window',function()
   local e,cu=env(); cu.lastScan={}; cu:BuildResults(); local w=cu.window or e.ChupgradesFrame
   assert(w and w.msg and w.cards and #w.cards==6,'complete results window missing'); assert(w:IsShown())
 end)
+test('budget and keep use separate gold/silver/copper boxes',function()
+  local e,cu=env(); cu.lastScan={}; cu:BuildResults(); local w=cu.window or e.ChupgradesFrame; local db=e.ChupgradesDB
+  local b,k=w.budgetField.boxes,w.reserveField.boxes; eq(#b,3); eq(#k,3)
+  local function typeIn(boxes,g,s2,c) boxes[1]:SetText(g); boxes[2]:SetText(s2); boxes[3]:SetText(c); boxes[2].scripts.OnEditFocusLost(boxes[2]); e.advance(0) end
+  typeIn(b,'1','33','38'); eq(db.budgetCopper,13338)
+  typeIn(b,'5','',''); eq(db.budgetCopper,50000)
+  typeIn(b,'','',''); eq(db.budgetCopper,nil)          -- empty budget = plan with carried money
+  typeIn(k,'2','50',''); eq(db.reserveCopper,25000)
+  typeIn(k,'','',''); eq(db.reserveCopper,0)           -- empty keep = keep nothing back
+  db.budgetCopper=12345; w.budgetField.restore(); eq(b[1]:GetText(),'1'); eq(b[2]:GetText(),'23'); eq(b[3]:GetText(),'45')
+  b[1]:SetText('99'); b[1].scripts.OnEscapePressed(b[1]); eq(b[1]:GetText(),'1'); e.advance(0); eq(db.budgetCopper,12345)
+end)
 test('every-upgrade pagination reaches items after sixth',function()
   local e,cu=env(); e.ChupgradesDB.showAll=true; e.ChupgradesDB.topFive=false; cu.lastScan={}
   for i=1,8 do local it=e.item(100+i,{score=10+i}); cu.lastScan[it.link]={price=100*i,equipLoc=it.loc,classID=4,subID=4} end

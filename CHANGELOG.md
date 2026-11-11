@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.9
+
+* Budget and Keep are back to separate gold, silver and copper boxes. Tab moves between them; empty Budget
+  plans with the money you carry, empty Keep keeps nothing back. `/cu budget` and `/cu keep` still accept `1g 33s 38c`.
+
 ## 0.9.8
 
 * Fixed results-window creation and added page controls so every matching upgrade is reachable.

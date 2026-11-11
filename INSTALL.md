@@ -141,8 +141,8 @@ Use `/cu stop` to cancel a search and keep your previous results.
 * **Biggest upgrades:** the five largest upgrades for the selected slot.
 * **Best value:** a cheapest-first ladder where each step is a bigger upgrade. **Show every upgrade**
   includes items outside that ladder. Use the page controls to move through more than six results.
-* **Shopping plan:** suggests purchases for your budget. In **Budget** and **Keep**, enter amounts
-  such as `1g 33s 38c` or `5` for five gold. **Enter** applies the field; **Escape** restores its saved value.
+* **Shopping plan:** suggests purchases for your budget. **Budget** and **Keep** each have separate
+  gold, silver and copper boxes. **Enter** or **Tab** applies (Tab moves to the next box), and **Escape** restores the saved value.
   A blank budget uses the money you carry; a blank keep-back amount clears the reserve.
 * **Move the window:** drag it to a convenient position. That position is saved. `/cu reset` restores its
   position if you want to start again.

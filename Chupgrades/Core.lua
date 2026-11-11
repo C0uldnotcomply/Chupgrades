@@ -1830,19 +1830,51 @@ function GetWindow()
   NewBackdrop(bdBackground,.03,.03,.03,1)
   close:SetFrameLevel(breakdownLevel+4)
   local allSearch=CreateFrame("Button",nil,win,"UIPanelButtonTemplate"); allSearch:SetSize(170,20); allSearch:SetPoint("BOTTOMRIGHT",-14,12); allSearch:SetText("Search all in Auctionator"); allSearch:SetScript("OnClick",function() local names,seen={},{}; for _,l in ipairs(CU.shownLinks or {}) do local n=GetItemInfo(l); if n and not seen[n] then seen[n]=true; table.insert(names,n) end end; if #names>0 then SearchInAuctionator(names) end end)
+  -- Budget / Keep: separate gold, silver and copper boxes. Enter or Tab applies (Tab moves to the
+  -- next box), clicking away applies, Escape puts back the saved value. All three empty = for
+  -- Budget, plan with the money you carry; for Keep, keep nothing back.
+  local COIN = { "|TInterface\\MoneyFrame\\UI-GoldIcon:0:0:2:0|t", "|TInterface\\MoneyFrame\\UI-SilverIcon:0:0:2:0|t",
+    "|TInterface\\MoneyFrame\\UI-CopperIcon:0:0:2:0|t" }
+  local UNIT = { 10000, 100, 1 }
   local function moneyField(label, x, field)
     local text=win:CreateFontString(nil,"OVERLAY","GameFontNormalSmall"); text:SetPoint("TOPLEFT",x,-60); text:SetText(label)
-    local box=CreateFrame("EditBox",nil,win,"InputBoxTemplate"); box:SetSize(140,20); box:SetPoint("TOPLEFT",x+68,-55); box:SetAutoFocus(false)
-    local function restore() box:SetText(field=="budgetCopper" and cfg[field]==nil and "" or MoneyInput(cfg[field] or 0)) end
-    box:SetScript("OnEscapePressed",function(self) restore(); self:ClearFocus() end)
-    box:SetScript("OnEnterPressed",function(self)
-      local input=self:GetText():match("^%s*(.-)%s*$")
-      local value,err=CU.ParseMoney(input)
-      if input=="" then value=field=="reserveCopper" and 0 or nil; err=nil end
-      if err then Print(err); restore(); return end
-      cfg[field]=value; self:ClearFocus(); CU:Render()
-    end)
-    return {label=text, box=box, restore=restore}
+    local holder=CreateFrame("Frame",nil,win); holder:SetSize(170,20); holder:SetPoint("TOPLEFT",x+60,-55)
+    local boxes={}
+    local function anyFocus() for _,b in ipairs(boxes) do if b:HasFocus() then return true end end return false end
+    holder.HasFocus=anyFocus -- the window's refresh asks the field whether it's being edited
+    local function restore()
+      local v=cfg[field]
+      if field=="reserveCopper" and (v or 0)<=0 then v=nil end
+      local parts=v and { math.floor(v/10000), math.floor(v/100)%100, v%100 } or { "", "", "" }
+      for i,b in ipairs(boxes) do b:SetText(tostring(parts[i])) end
+    end
+    local function commit()
+      local any,total=false,0
+      for i,b in ipairs(boxes) do
+        local n=tonumber((b:GetText() or ""):match("^%s*(%d+)%s*$"))
+        if n then any=true; total=total+n*UNIT[i] end
+      end
+      if field=="budgetCopper" then cfg[field]=(any and total>0) and total or nil
+      else cfg[field]=any and total or 0 end
+      CU:Render()
+    end
+    local prev=holder
+    for i=1,3 do
+      local b=CreateFrame("EditBox",nil,holder,"InputBoxTemplate")
+      b:SetSize(i==1 and 46 or 26,20); b:SetAutoFocus(false); b:SetNumeric(true); b:SetMaxLetters(i==1 and 6 or 2)
+      if i==1 then b:SetPoint("LEFT",holder,"LEFT",6,0) else b:SetPoint("LEFT",prev,"RIGHT",8,0) end
+      local coin=holder:CreateFontString(nil,"OVERLAY","GameFontHighlightSmall"); coin:SetPoint("LEFT",b,"RIGHT",1,0); coin:SetText(COIN[i])
+      b:SetScript("OnEnterPressed",function(self) self:ClearFocus() end)
+      b:SetScript("OnTabPressed",function(self) local nb=boxes[i%3+1]; self:ClearFocus(); nb:SetFocus(); nb:HighlightText() end)
+      b:SetScript("OnEditFocusLost",function()
+        -- Wait a frame: if focus just moved to a sibling box, keep editing instead of applying.
+        C_Timer.After(0,function() if not anyFocus() then commit() end end)
+      end)
+      b:SetScript("OnEscapePressed",function() for _,o in ipairs(boxes) do o:ClearFocus() end restore() end)
+      boxes[i]=b; prev=coin
+    end
+    restore()
+    return {label=text, box=holder, boxes=boxes, restore=restore}
   end
   win.budgetField=moneyField("Budget",244,"budgetCopper")
   win.reserveField=moneyField("Keep",570,"reserveCopper")
